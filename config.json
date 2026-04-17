@@ -1,0 +1,70 @@
+{
+  "send": {
+    "workers": 20,
+    "maxLoopTx": 10000,
+    "minDelayTxSeconds": 60,
+    "maxDelayTxSeconds": 100,
+    "hourlyMaxTx": 10,
+    "tierAmounts": {
+      "unranked": {
+        "min": "10",
+        "max": "100",
+        "decimals": 3
+      },
+      "newbie": {
+        "min": "10",
+        "max": "110",
+        "decimals": 3
+      },
+      "advanced": {
+        "min": "25",
+        "max": "110",
+        "decimals": 3
+      },
+      "pro": {
+        "min": "100",
+        "max": "105",
+        "decimals": 3
+      },
+      "elite": {
+        "min": "100",
+        "max": "105",
+        "decimals": 3
+      }
+    }
+  },
+  "recipientFile": "recipient.txt",
+  "session": {
+    "proactiveVercelRefreshMinutes": 0,
+    "browserChallengeRetryAfterSeconds": 120,
+    "maxSessionReuseTransientAttempts": 3,
+    "maxSessionReuseTransientBrowserRefreshes": 2,
+    "transientBrowserRefreshTriggerFailures": 1,
+    "sessionReuseTransientRetryAfterSeconds": 30,
+    "maxConcurrentSessionReuse": 1,
+    "sessionReuseRetryJitterSeconds": 8
+  },
+  "ui": {
+    "dashboard": true,
+    "logLines": 5
+  },
+  "safety": {
+    "minScoreThreshold": 0,
+    "minHoldBalanceCc": 5
+  },
+  "profitability": {
+    "minRecoveryPercent": 100,
+    "retryIntervalSeconds": 60
+  },
+  "telegram": {
+    "enabled": true,
+    "botToken": "",
+    "allowedChatIds": [],
+    "autoReport": {
+      "enabled": true,
+      "minIntervalMinutes": 30,
+      "reportAtCycleStart": true,
+      "reportOnHourlyCapReached": true
+    }
+  }
+}

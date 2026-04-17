@@ -1,0 +1,26 @@
+{
+  "name": "rootsfi-bot",
+  "version": "1.0.0",
+  "description": "RootsFi API Login + Balance Bot",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "login": "node index.js",
+    "reward": "node reward.js"
+  },
+  "keywords": [
+    "rootsfi",
+    "bot",
+    "automation"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "puppeteer": "^24.0.0",
+    "puppeteer-extra": "^3.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2",
+    "undici": "^8.0.2"
+  }
+}

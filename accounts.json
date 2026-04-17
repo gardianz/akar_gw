@@ -1,0 +1,15 @@
+{
+  "defaultAccount": "Account 1",
+  "accounts": [
+    {
+      "name": "Account 1",
+      "email": "email1@gmail.com",
+      "address": "alias1::1220abcd..."
+    },
+    {
+      "name": "Account 2",
+      "email": "email2@gmail.com",
+      "address": "alias2::1220efgh..."
+    }
+  ]
+}
