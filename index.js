@@ -2856,6 +2856,11 @@ function normalizeConfig(rawConfig) {
     retryIntervalSeconds: Math.max(10, clampToNonNegativeInt(profitInput.retryIntervalSeconds, 60))
   };
 
+  const captchaInput = isObject(rawConfig.captcha) ? rawConfig.captcha : {};
+  const captcha = {
+    apiKey: String(captchaInput.apiKey || "").trim()
+  };
+
   const tgInput = isObject(rawConfig.telegram) ? rawConfig.telegram : {};
   const tgAutoReportInput = isObject(tgInput.autoReport) ? tgInput.autoReport : {};
   const allowedChatIdsRaw = Array.isArray(tgInput.allowedChatIds)
@@ -2894,6 +2899,7 @@ function normalizeConfig(rawConfig) {
     safety,
     telegram,
     profitability,
+    captcha,
     proxyUrl: null
   };
 }
@@ -3376,6 +3382,99 @@ function isTrafficCongestionError(error) {
     msg.includes("network is currently congested") ||
     msg.includes("acknowledgetrafficwarning")
   );
+}
+
+// ============================================================================
+// Cloudflare Turnstile challenge (per-transfer anti-bot)
+// Backend triggers this when networkRecovery is not "green": /api/send/transfer
+// returns HTTP 403 "Network is congested. A challenge must be ..." unless body
+// carries { acknowledgeTrafficWarning: true, trafficChallengeToken: <token> }.
+// We solve the Turnstile widget via 2Captcha's API (no browser required).
+// ============================================================================
+const TURNSTILE_SITEKEY = "0x4AAAAAAC-oOGMu5lxFvc7w";
+const TURNSTILE_PAGEURL = "https://bridge.rootsfi.com/send";
+const TWOCAPTCHA_IN_URL = "https://2captcha.com/in.php";
+const TWOCAPTCHA_RES_URL = "https://2captcha.com/res.php";
+const TWOCAPTCHA_POLL_INTERVAL_MS = 5000;
+const TWOCAPTCHA_POLL_TIMEOUT_MS = 180000;
+const TWOCAPTCHA_INITIAL_WAIT_MS = 10000;
+
+function isTrafficChallengeRequiredError(error) {
+  if (!error) return false;
+  const status = Number(error.status);
+  const msg = String(error.message || "").toLowerCase();
+  if (status !== 403) return false;
+  return (
+    msg.includes("challenge must be") ||
+    msg.includes("challenge token") ||
+    msg.includes("traffic challenge") ||
+    msg.includes("acknowledgetrafficwarning")
+  );
+}
+
+async function solveTurnstileVia2Captcha(apiKey, { sitekey = TURNSTILE_SITEKEY, pageurl = TURNSTILE_PAGEURL } = {}) {
+  if (!apiKey) {
+    throw new Error("2Captcha API key missing (config.captcha.apiKey)");
+  }
+
+  const fetchFn = (typeof globalThis.fetch === "function") ? globalThis.fetch.bind(globalThis) : null;
+  if (!fetchFn) {
+    throw new Error("global fetch is not available in this Node runtime");
+  }
+
+  const submitUrl = `${TWOCAPTCHA_IN_URL}?key=${encodeURIComponent(apiKey)}`
+    + `&method=turnstile&sitekey=${encodeURIComponent(sitekey)}`
+    + `&pageurl=${encodeURIComponent(pageurl)}&json=1`;
+
+  const submitResp = await fetchFn(submitUrl, { method: "GET" });
+  const submitText = await submitResp.text();
+  let submitJson;
+  try {
+    submitJson = JSON.parse(submitText);
+  } catch {
+    throw new Error(`2Captcha in.php returned non-JSON: ${submitText.slice(0, 200)}`);
+  }
+  if (!submitJson || submitJson.status !== 1) {
+    throw new Error(`2Captcha in.php error: ${submitJson && submitJson.request ? submitJson.request : submitText.slice(0, 200)}`);
+  }
+
+  const captchaId = String(submitJson.request);
+  console.log(`[captcha] 2Captcha task submitted (id=${captchaId}). Waiting for solve...`);
+  await sleep(TWOCAPTCHA_INITIAL_WAIT_MS);
+
+  const deadline = Date.now() + TWOCAPTCHA_POLL_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    const pollUrl = `${TWOCAPTCHA_RES_URL}?key=${encodeURIComponent(apiKey)}`
+      + `&action=get&id=${encodeURIComponent(captchaId)}&json=1`;
+    const pollResp = await fetchFn(pollUrl, { method: "GET" });
+    const pollText = await pollResp.text();
+    let pollJson;
+    try {
+      pollJson = JSON.parse(pollText);
+    } catch {
+      console.log(`[captcha] poll parse error: ${pollText.slice(0, 160)}. Retrying...`);
+      await sleep(TWOCAPTCHA_POLL_INTERVAL_MS);
+      continue;
+    }
+
+    if (pollJson.status === 1) {
+      const token = String(pollJson.request || "").trim();
+      if (!token) {
+        throw new Error("2Captcha returned empty token");
+      }
+      console.log(`[captcha] Turnstile token received (len=${token.length}).`);
+      return token;
+    }
+
+    if (pollJson.request === "CAPCHA_NOT_READY") {
+      await sleep(TWOCAPTCHA_POLL_INTERVAL_MS);
+      continue;
+    }
+
+    throw new Error(`2Captcha res.php error: ${pollJson.request || pollText.slice(0, 200)}`);
+  }
+
+  throw new Error(`2Captcha timed out after ${TWOCAPTCHA_POLL_TIMEOUT_MS / 1000}s waiting for Turnstile token`);
 }
 let lastProfitabilityStatus = null;
 
@@ -4010,20 +4109,25 @@ class RootsFiApiClient {
     });
   }
 
-  async sendCcTransfer(recipient, amount, idempotencyKey) {
+  async sendCcTransfer(recipient, amount, idempotencyKey, trafficChallengeToken = null) {
+    const body = {
+      recipientType: "canton_wallet",
+      recipient,
+      amount,
+      idempotencyKey,
+      preferredNetwork: "canton",
+      tokenType: "CC",
+      instrumentId: "Amulet"
+    };
+    if (trafficChallengeToken) {
+      body.acknowledgeTrafficWarning = true;
+      body.trafficChallengeToken = trafficChallengeToken;
+    }
     return this.requestJson("POST", this.paths.sendTransfer, {
       refererPath: this.paths.send,
       timeoutMs: 60000,
       skipInfiniteTimeoutRetry: true,
-      body: {
-        recipientType: "canton_wallet",
-        recipient,
-        amount,
-        idempotencyKey,
-        preferredNetwork: "canton",
-        tokenType: "CC",
-        instrumentId: "Amulet"
-      }
+      body
     });
   }
 
@@ -4052,20 +4156,25 @@ class RootsFiApiClient {
     });
   }
 
-  async sendCcTransferByUsername(username, amount, idempotencyKey) {
+  async sendCcTransferByUsername(username, amount, idempotencyKey, trafficChallengeToken = null) {
+    const body = {
+      recipientType: "user",
+      recipient: username,
+      amount,
+      idempotencyKey,
+      preferredNetwork: "canton",
+      tokenType: "CC",
+      instrumentId: "Amulet"
+    };
+    if (trafficChallengeToken) {
+      body.acknowledgeTrafficWarning = true;
+      body.trafficChallengeToken = trafficChallengeToken;
+    }
     return this.requestJson("POST", this.paths.sendTransfer, {
       refererPath: this.paths.send,
       timeoutMs: 60000,
       skipInfiniteTimeoutRetry: true,
-      body: {
-        recipientType: "user",
-        recipient: username,
-        amount,
-        idempotencyKey,
-        preferredNetwork: "canton",
-        tokenType: "CC",
-        instrumentId: "Amulet"
-      }
+      body
     });
   }
 
@@ -4481,23 +4590,50 @@ async function executeCcSendFlow(client, sendRequest, config, onCheckpointRefres
     sendRequest.idempotencyKey = crypto.randomUUID();
   }
   const idempotencyKey = sendRequest.idempotencyKey;
+
+  // Step 3b: Recovery gate already passed (>= minRecoveryPercent). At this
+  // point the backend always requires a Turnstile token on /api/send/transfer
+  // regardless of green/amber mode — so pre-solve unconditionally.
+  stepLog(`[captcha] Pre-solving Turnstile sebelum transfer...`);
+  if (dashboard) {
+    dashboard.setState({
+      phase: "captcha",
+      send: `Pre-solve Turnstile — ${sendRequest.amount} CC -> ${sendRequest.label}`
+    });
+  }
+  let challengeToken = null;
+  try {
+    challengeToken = await solveTurnstileVia2Captcha(config.captcha.apiKey);
+    stepLog(`[captcha] Token siap, lanjut transfer dengan trafficChallengeToken.`);
+    if (dashboard) {
+      dashboard.setState({
+        phase: "send",
+        send: `${sendRequest.amount} CC -> ${sendRequest.label} (with captcha token)`
+      });
+    }
+  } catch (error) {
+    stepLog(`[captcha] Pre-solve Turnstile gagal: ${error.message}`);
+    throw error;
+  }
+
   stepLog(`[step] Transfer CC (idempotencyKey=${idempotencyKey})`);
 
   let transferResponse = null;
-  const transferFn = resolvedUsername
-    ? () => client.sendCcTransferByUsername(resolvedUsername, sendRequest.amount, idempotencyKey)
-    : () => client.sendCcTransfer(sendRequest.address, sendRequest.amount, idempotencyKey);
+  const MAX_CHALLENGE_RESOLVES = 3;
+  let challengeResolveAttempts = 0;
+
+  // Do NOT retry internally: Turnstile tokens are single-use, so a 2nd attempt
+  // with the same token will always 403. Outer loop handles captcha refresh.
+  const runTransferOnce = () => (resolvedUsername
+    ? client.sendCcTransferByUsername(resolvedUsername, sendRequest.amount, idempotencyKey, challengeToken)
+    : client.sendCcTransfer(sendRequest.address, sendRequest.amount, idempotencyKey, challengeToken));
 
   while (true) {
     try {
-      transferResponse = await apiCallWithRetry(
-        transferFn,
+      transferResponse = await apiCallWithTimeout(
+        runTransferOnce,
         "Transfer CC",
-        API_CALL_MAX_RETRIES,
-        75000,
-        {
-          maxConsecutiveTimeouts: 1
-        }
+        75000
       );
       break;
     } catch (error) {
@@ -4510,6 +4646,40 @@ async function executeCcSendFlow(client, sendRequest, config, onCheckpointRefres
           `Transfer CC timeout for ${sendRequest.label}. Triggering immediate account restart.`,
           1
         );
+      }
+
+      if (isTrafficChallengeRequiredError(error)) {
+        challengeResolveAttempts += 1;
+        if (challengeResolveAttempts > MAX_CHALLENGE_RESOLVES) {
+          stepLog(`[captcha] Sudah ${MAX_CHALLENGE_RESOLVES}x solve Turnstile masih 403. Menyerah untuk TX ini.`);
+          throw error;
+        }
+        stepLog(
+          `[captcha] Transfer ditolak 403 (challenge required). ` +
+          `Fresh Turnstile token (attempt ${challengeResolveAttempts}/${MAX_CHALLENGE_RESOLVES})...`
+        );
+        if (dashboard) {
+          dashboard.setState({
+            phase: "captcha",
+            send: `403 Challenge — solving fresh Turnstile #${challengeResolveAttempts} (${sendRequest.amount} CC -> ${sendRequest.label})`
+          });
+        }
+        // Always discard old token; Turnstile tokens are single-use.
+        challengeToken = null;
+        try {
+          challengeToken = await solveTurnstileVia2Captcha(config.captcha.apiKey);
+        } catch (solveError) {
+          stepLog(`[captcha] Gagal solve Turnstile: ${solveError.message}`);
+          throw solveError;
+        }
+        stepLog(`[captcha] Token fresh siap, retry transfer...`);
+        if (dashboard) {
+          dashboard.setState({
+            phase: "send",
+            send: `${sendRequest.amount} CC -> ${sendRequest.label} (retry with fresh token)`
+          });
+        }
+        continue;
       }
 
       if (isTrafficCongestionError(error)) {

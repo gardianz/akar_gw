@@ -1,0 +1,150 @@
+TUTORIAL ROOTSFI BOT
+====================
+
+
+[1] INSTALL
+-----------
+Syarat: Node.js 18+
+
+  npm install
+
+
+[2] JALANKAN
+------------
+  npm start
+
+Pilih mode:
+  1. internal     = kirim antar akun sendiri
+  2. external     = kirim ke alamat di recipient.txt
+  3. balance-only = cek saldo saja
+
+OTP dari email hanya diminta pertama kali (session disimpan di tokens.json).
+
+
+[3] FILE YANG HARUS DIISI
+--------------------------
+
+A) accounts.json — daftar akun bot
+
+  {
+    "accounts": [
+      { "name": "akun1", "email": "a@gmail.com", "address": "roots...::1220..." },
+      { "name": "akun2", "email": "b@gmail.com", "address": "roots...::1220..." }
+    ]
+  }
+
+  - name    : unik tiap akun (bebas)
+  - email   : email terdaftar di RootsFi
+  - address : alamat Canton (wajib untuk mode internal)
+
+  Minimal 2 akun untuk mode internal.
+
+
+B) config.json — pengaturan bot
+
+  {
+    "send": {
+      "workers": 3,
+      "maxLoopTx": 10000,
+      "minDelayTxSeconds": 1,
+      "maxDelayTxSeconds": 10,
+      "delayCycleSeconds": 15,
+      "sequentialAllRounds": true,
+      "tierAmounts": {
+        "unranked": { "min": "10",  "max": "100", "decimals": 3 },
+        "newbie":   { "min": "10",  "max": "30",  "decimals": 3 },
+        "advanced": { "min": "25",  "max": "50",  "decimals": 3 },
+        "pro":      { "min": "50",  "max": "70",  "decimals": 3 },
+        "elite":    { "min": "100", "max": "200", "decimals": 3 }
+      }
+    },
+    "recipientFile": "recipient.txt",
+    "ui": { "dashboard": true, "logLines": 5 },
+    "safety": { "minScoreThreshold": 0, "minHoldBalanceCc": 10 }
+  }
+
+  PENGATURAN KIRIM (send)
+  ~~~~~~~~~~~~~~~~~~~~~~~
+  workers             = jumlah akun yang kirim PARALEL dalam satu batch
+                        contoh: 3 = 3 akun jalan bersamaan tiap batch
+
+  maxLoopTx           = batas total round per sesi bot (tinggi = jalan terus)
+
+  minDelayTxSeconds   = jeda MIN antar batch worker (detik)
+  maxDelayTxSeconds   = jeda MAX antar batch worker (detik)
+                        contoh: 1 & 10 = jeda 1-10 detik antar batch
+
+  delayCycleSeconds   = jeda antar ROUND (detik)
+                        1 round = semua akun sudah kirim 1x
+                        contoh: 15 = tunggu 15 detik sebelum round berikutnya
+
+  sequentialAllRounds = true  → kirim sequential per round (disarankan)
+
+  tierAmounts         = nominal CC per kirim, DITENTUKAN oleh TIER akun
+                        Bot cek tier akun dari /api/rewards, lalu pakai range
+                        sesuai tier-nya.
+
+                        unranked = fallback jika tier tidak dikenal
+                        newbie / advanced / pro / elite = sesuai tier RootsFi
+
+                        min      = minimum CC per tx
+                        max      = maksimum CC per tx
+                        decimals = jumlah desimal (contoh: 3 = 12.345)
+
+  PENGATURAN SAFETY (safety)
+  ~~~~~~~~~~~~~~~~~~~~~~~~~~
+  minScoreThreshold   = skor minimum, akun di bawah nilai ini di-skip
+                        contoh: 40 = akun dengan score < 40/100 dilewati
+                        set 0 untuk nonaktifkan
+
+  minHoldBalanceCc    = saldo CC minimum yang selalu ditahan (tidak dikirim)
+                        contoh: 10 = selalu simpan >= 10 CC di tiap akun
+
+  PENGATURAN UI (ui)
+  ~~~~~~~~~~~~~~~~~~
+  dashboard           = true  → tampilkan dashboard pinned di terminal
+  logLines            = jumlah baris log terakhir yang ditampilkan
+
+
+C) recipient.txt — hanya untuk mode external
+
+  Satu alamat per baris:
+  roots...::1220...
+  roots...::1220...
+
+
+[4] ALUR BOT (mode internal)
+-----------------------------
+- Tiap ROUND: setiap akun kirim 1 TX ke akun lain (offset +1 tiap round).
+- Akun tidak pernah kirim ke dirinya sendiri.
+- Cooldown server: 60s antar TX per akun, 10 menit sebelum "send back".
+- Smart-fill: akun miskin (insufficient-balance) otomatis dapat top-up dari
+  akun kaya dalam round yang sama (tetap hormati cooldown).
+- Nominal kirim mengikuti TIER sender (tierAmounts).
+
+
+[5] DASHBOARD
+-------------
+Kolom per akun:
+  Akun | Status | CC | TX Progress | Send Plan | Score / Tier
+       | Rewards/Week | Diff Reward (earning sesi bot)
+
+Banner atas:
+  Rewards this week (all accounts)  → total reward minggu ini
+  Session earnings (all accounts)   → total yang didapat selama bot jalan
+  Initial balance (all accounts)    → hanya muncul di mode balance-only
+
+
+[6] STOP BOT
+------------
+Ctrl+C di terminal.
+
+
+[7] TIPS
+--------
+- Jalankan mode balance-only dulu untuk cek saldo & tier tiap akun.
+- Pastikan saldo cukup: minHoldBalanceCc + tierAmounts[tier].max.
+  contoh Advanced: 10 + 50 = minimal 60 CC per akun.
+- File tokens.json berisi session login → JANGAN di-share.
+- Kalau OTP expired atau session invalid, hapus tokens.json lalu jalankan ulang.
+- workers besar = lebih cepat tapi lebih ramai di jaringan; mulai dari 2-3.

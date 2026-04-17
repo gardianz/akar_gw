@@ -1,6 +1,6 @@
 {
   "send": {
-    "workers": 20,
+    "workers": 50,
     "maxLoopTx": 10000,
     "minDelayTxSeconds": 60,
     "maxDelayTxSeconds": 100,
@@ -55,6 +55,9 @@
   "profitability": {
     "minRecoveryPercent": 100,
     "retryIntervalSeconds": 60
+  },
+  "captcha": {
+    "apiKey": ""
   },
   "telegram": {
     "enabled": true,
