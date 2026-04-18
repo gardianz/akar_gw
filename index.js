@@ -2851,8 +2851,12 @@ function normalizeConfig(rawConfig) {
   };
 
   const profitInput = isObject(rawConfig.profitability) ? rawConfig.profitability : {};
+  const rawAllowedModes = Array.isArray(profitInput.allowedModes) ? profitInput.allowedModes : ["amber", "green"];
+  const allowedModes = rawAllowedModes
+    .map((m) => String(m || "").trim().toLowerCase())
+    .filter(Boolean);
   const profitability = {
-    minRecoveryPercent: Math.max(0, Number(profitInput.minRecoveryPercent) || 100),
+    allowedModes: allowedModes.length > 0 ? allowedModes : ["amber", "green"],
     retryIntervalSeconds: Math.max(10, clampToNonNegativeInt(profitInput.retryIntervalSeconds, 60))
   };
 
@@ -3370,9 +3374,10 @@ async function solveBrowserChallenge(baseUrl, onboardPath, userAgent, headless =
 
 // ============================================================================
 // Profitability / Network Recovery Check
-// Cek currentRecovery dari /api/rewards sebelum TX (per akun, pakai client authenticated).
-// Jika di bawah minRecoveryPercent, pause akun sampai recovery naik.
-// HTTP 409 "Network is currently congested" = recovery drop, harus wait dulu.
+// Cek networkRecovery.mode dari /api/rewards sebelum TX (per akun, pakai client authenticated).
+// TX diijinkan HANYA saat mode = "amber" atau "green"; selain itu (red/unknown)
+// pause akun sampai mode naik. Pakai mode (bukan %) karena threshold sering diubah dev.
+// HTTP 409 "Network is currently congested" = mode drop → wait dulu.
 // ============================================================================
 function isTrafficCongestionError(error) {
   if (!error) return false;
@@ -3494,22 +3499,29 @@ function parseNetworkRecovery(rewardsData) {
 }
 
 async function waitForProfitabilityWithClient(client, config, accountLogTag) {
-  const minPercent = config.profitability.minRecoveryPercent;
   const retryMs = config.profitability.retryIntervalSeconds * 1000;
   const tag = accountLogTag ? `[profitability ${accountLogTag}]` : "[profitability]";
 
-  // Max consecutive empty responses before triggering session restart
-  const MAX_EMPTY_RESPONSE_RETRIES = 5;
+  // Mode-based gate (configured via config.profitability.allowedModes).
+  // Using mode (not percent) because devs change threshold rules frequently.
+  const ALLOWED_MODES = new Set(
+    (config.profitability.allowedModes || ["amber", "green"]).map((m) => String(m).toLowerCase())
+  );
+  const allowedModesLabel = [...ALLOWED_MODES].join("/");
+
+  // Empty response ({}) on rewards API = session/cookies expired.
+  // No tolerance: 1st empty response triggers immediate soft restart.
+  const MAX_EMPTY_RESPONSE_RETRIES = 1;
   // Max consecutive API errors before triggering session restart
   const MAX_API_ERROR_RETRIES = 5;
-  // Max total WAIT retries (recovery below threshold) before soft restart
+  // Max total WAIT retries (mode not allowed) before soft restart
   const MAX_WAIT_RETRIES = 30; // 30 * 60s = 30 min max wait
 
   let consecutiveEmptyResponses = 0;
   let consecutiveApiErrors = 0;
   let totalWaitRetries = 0;
 
-  console.log(`${tag} Cek network recovery (threshold: >=${minPercent}%)...`);
+  console.log(`${tag} Cek network recovery mode (allowed: ${allowedModesLabel})...`);
 
   while (true) {
     try {
@@ -3553,9 +3565,10 @@ async function waitForProfitabilityWithClient(client, config, accountLogTag) {
       consecutiveEmptyResponses = 0;
       lastProfitabilityStatus = status;
 
-      if (status.currentRecoveryPercent >= minPercent) {
+      const modeKey = String(status.mode || "").toLowerCase();
+      if (ALLOWED_MODES.has(modeKey)) {
         console.log(
-          `${tag} OK — ${status.modeLabel} ${status.currentRecoveryPercent}% >= ${minPercent}% ` +
+          `${tag} OK — ${status.modeLabel} ${status.currentRecoveryPercent}% ` +
           `(${status.trendLabel}: ${Math.round(status.trendRecovery * 100)}%) — TX dilanjutkan`
         );
         return status;
@@ -3566,7 +3579,7 @@ async function waitForProfitabilityWithClient(client, config, accountLogTag) {
       // After MAX_WAIT_RETRIES, soft restart to avoid being stuck forever
       if (totalWaitRetries >= MAX_WAIT_RETRIES) {
         console.log(
-          `${tag} Recovery masih ${status.currentRecoveryPercent}% < ${minPercent}% setelah ${totalWaitRetries} retry ` +
+          `${tag} Mode masih ${status.modeLabel} (${status.currentRecoveryPercent}%) setelah ${totalWaitRetries} retry ` +
           `(${Math.round(totalWaitRetries * retryMs / 60000)} menit). Soft restart untuk refresh session...`
         );
         throw new SoftRestartError(
@@ -3576,7 +3589,7 @@ async function waitForProfitabilityWithClient(client, config, accountLogTag) {
       }
 
       console.log(
-        `${tag} WAIT — ${status.modeLabel} ${status.currentRecoveryPercent}% < ${minPercent}% ` +
+        `${tag} WAIT — ${status.modeLabel} ${status.currentRecoveryPercent}% (mode bukan ${allowedModesLabel}) ` +
         `(${status.trendLabel}: ${Math.round(status.trendRecovery * 100)}%) — TX ditahan, retry ${Math.round(retryMs / 1000)}s ` +
         `(${totalWaitRetries}/${MAX_WAIT_RETRIES})...`
       );
@@ -3584,6 +3597,17 @@ async function waitForProfitabilityWithClient(client, config, accountLogTag) {
       // Re-throw SoftRestartError immediately
       if (error && error.isSoftRestart) {
         throw error;
+      }
+
+      // Immediate restart on expired Vercel session / 401-403 on rewards API
+      if (error && (error.vercelChallenge || error.sessionExpired)) {
+        console.log(
+          `${tag} Session Vercel expired (${error.message}). Trigger soft restart untuk refresh cookies...`
+        );
+        throw new SoftRestartError(
+          `${tag} Profitability: session expired — perlu restart`,
+          1
+        );
       }
 
       consecutiveApiErrors += 1;
@@ -4199,7 +4223,26 @@ class RootsFiApiClient {
       clearTimeout(timeoutId);
       this.parseSetCookieHeaders(response.headers);
 
+      const vercelMitigated = String(response.headers.get("x-vercel-mitigated") || "").toLowerCase();
       const text = await response.text();
+
+      // Detect expired Vercel session: challenge HTML or 401/403 on rewards API
+      if (vercelMitigated === "challenge" || (text && text.trim().startsWith("<"))) {
+        const err = new Error(
+          `Rewards API blocked by Vercel challenge (HTTP ${response.status}) — session expired`
+        );
+        err.status = response.status;
+        err.vercelChallenge = true;
+        throw err;
+      }
+
+      if (response.status === 401 || response.status === 403) {
+        const err = new Error(`Rewards API HTTP ${response.status} — session expired`);
+        err.status = response.status;
+        err.sessionExpired = true;
+        throw err;
+      }
+
       if (!text) return {};
 
       try {
@@ -4591,7 +4634,7 @@ async function executeCcSendFlow(client, sendRequest, config, onCheckpointRefres
   }
   const idempotencyKey = sendRequest.idempotencyKey;
 
-  // Step 3b: Recovery gate already passed (>= minRecoveryPercent). At this
+  // Step 3b: Recovery gate already passed (mode amber/green). At this
   // point the backend always requires a Turnstile token on /api/send/transfer
   // regardless of green/amber mode — so pre-solve unconditionally.
   stepLog(`[captcha] Pre-solving Turnstile sebelum transfer...`);
@@ -4683,15 +4726,16 @@ async function executeCcSendFlow(client, sendRequest, config, onCheckpointRefres
       }
 
       if (isTrafficCongestionError(error)) {
+        const allowedLabel = (config.profitability.allowedModes || ["amber", "green"]).join("/");
         stepLog(
           `[profitability] Transfer ditolak 409 (Network congested). ` +
-          `Menunggu recovery >= ${config.profitability.minRecoveryPercent}%...`
+          `Menunggu mode ${allowedLabel}...`
         );
         // Update dashboard to show we're waiting for profitability, not stuck on SEND
         if (dashboard) {
           dashboard.setState({
             phase: "profitability-check",
-            send: `409 Congested — waiting recovery >= ${config.profitability.minRecoveryPercent}% (${sendRequest.amount} CC -> ${sendRequest.label})`
+            send: `409 Congested — waiting mode ${allowedLabel} (${sendRequest.amount} CC -> ${sendRequest.label})`
           });
         }
         await waitForProfitabilityWithClient(client, config, accountLogTag);
@@ -7485,7 +7529,7 @@ async function runDailyCycle(context) {
     const maxDelay = clampToNonNegativeInt(config.send.maxDelayTxSeconds, INTERNAL_API_DEFAULTS.send.maxDelayTxSeconds);
     console.log(`[cycle] Per-account TX delay: ${minDelay}-${maxDelay}s | Hourly cap: ${HOURLY_MAX_TX_PER_ACCOUNT}/hr | Reciprocal pair cooldown: ${Math.round(SEND_PAIR_COOLDOWN_MS / 1000)}s`);
   }
-  console.log(`[cycle] Profitability gate: minRecovery=${config.profitability.minRecoveryPercent}% | retryInterval=${config.profitability.retryIntervalSeconds}s`);
+  console.log(`[cycle] Profitability gate: allowedModes=${(config.profitability.allowedModes || []).join("/")} | retryInterval=${config.profitability.retryIntervalSeconds}s`);
   console.log(`${"#".repeat(70)}\n`);
 
   const results = [];
@@ -7528,6 +7572,23 @@ async function runDailyCycle(context) {
       activeDashboardRef.setState({ uptime: formatDuration(elapsedMs) });
     }
   }, 1000);
+
+  // Periodic Telegram auto-report: fire every minIntervalMinutes regardless
+  // of TX events (cycle-start / hourly-cap). Skip if disabled.
+  let periodicReportTicker = null;
+  if (
+    config.telegram && config.telegram.enabled &&
+    config.telegram.autoReport && config.telegram.autoReport.enabled
+  ) {
+    const intervalMs = Math.max(1, Number(config.telegram.autoReport.minIntervalMinutes || 30)) * 60 * 1000;
+    periodicReportTicker = setInterval(() => {
+      triggerAutoReport(config, sortedAccounts, inFlight, "periodic").catch((err) => {
+        console.warn(`[telegram] Periodic auto-report failed: ${err.message}`);
+      });
+    }, intervalMs);
+    if (typeof periodicReportTicker.unref === "function") periodicReportTicker.unref();
+    console.log(`[telegram] Periodic auto-report scheduled every ${config.telegram.autoReport.minIntervalMinutes} minute(s)`);
+  }
 
   const updateGlobalDashboard = () => {
     if (!activeDashboardRef || typeof activeDashboardRef.setState !== "function") return;
@@ -7801,6 +7862,7 @@ async function runDailyCycle(context) {
   }
 
   clearInterval(uptimeTicker);
+  if (periodicReportTicker) clearInterval(periodicReportTicker);
 
   if (!args.dryRun) {
     saveDailyProgress(tokens, 0, globalSwapsOk + globalSwapsFail, perAccountTxStats);

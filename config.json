@@ -1,6 +1,6 @@
 {
   "send": {
-    "workers": 50,
+    "workers": 17,
     "maxLoopTx": 10000,
     "minDelayTxSeconds": 60,
     "maxDelayTxSeconds": 100,
@@ -46,14 +46,17 @@
   },
   "ui": {
     "dashboard": true,
-    "logLines": 5
+    "logLines": 30
   },
   "safety": {
     "minScoreThreshold": 0,
     "minHoldBalanceCc": 5
   },
   "profitability": {
-    "minRecoveryPercent": 100,
+    "allowedModes": [
+      "amber",
+      "green"
+    ],
     "retryIntervalSeconds": 60
   },
   "captcha": {
