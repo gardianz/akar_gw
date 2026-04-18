@@ -499,8 +499,14 @@ function buildInternalSendRequests(
 
   const primaryOffset = getRotatingOffset(sortedAccounts.length, loopRound);
   const offsetPriority = buildInternalOffsetPriority(sortedAccounts.length, primaryOffset);
-  const senderTierKey = getAccountTierKey(senderName);
-  const amount = generateRandomCcAmount(sendPolicy, senderTierKey);
+  let senderTierKey = getAccountTierKey(senderName);
+
+if (!senderTierKey) {
+  console.log(`[INFO] ${senderName} tier belum ada → pakai unranked`);
+  senderTierKey = "unranked";
+}
+
+const amount = generateRandomCcAmount(sendPolicy, senderTierKey);
   const requests = [];
   let shortestBlockedCooldownSeconds = 0;
   let skippedByAvoidCount = 0;
@@ -6454,21 +6460,9 @@ async function processAccount(context) {
       // Guard: jangan kirim kalau tier belum diketahui (masih fallback "unranked")
       // karena amount bisa salah (terlalu kecil = tidak qualify, atau tidak sesuai rules)
       if (senderTierKey === "unranked" && !tierDisplayNameByAccount.has(account.name)) {
-        console.log(withAccountTag(accountLogTag, `[warn] Tier belum diketahui, defer send sampai tier ter-fetch`));
-        buildDeferResult = {
-          success: true,
-          account: account.name,
-          mode: "tier-unknown-deferred",
-          deferred: true,
-          deferReason: "tier-unknown",
-          deferRetryAfterSeconds: 30,
-          deferRequiredAmount: null,
-          deferAvailableAmount: null,
-          txCompleted: 0,
-          txSkipped: 0
-        };
-        return;
-      }
+  console.log(withAccountTag(accountLogTag, `[INFO] ${account.name} tier belum ada → lanjut pakai unranked`));
+  // JANGAN return, biarin lanjut
+}
 
       const senderTierRange = resolveAmountRangeForTier(sendPolicy, senderTierKey);
       const sendPolicyForSender = { ...sendPolicy, senderTier: senderTierKey };
