@@ -499,14 +499,8 @@ function buildInternalSendRequests(
 
   const primaryOffset = getRotatingOffset(sortedAccounts.length, loopRound);
   const offsetPriority = buildInternalOffsetPriority(sortedAccounts.length, primaryOffset);
-  let senderTierKey = getAccountTierKey(senderName);
-
-if (!senderTierKey) {
-  console.log(`[INFO] ${senderName} tier belum ada → pakai unranked`);
-  senderTierKey = "unranked";
-}
-
-const amount = generateRandomCcAmount(sendPolicy, senderTierKey);
+  const senderTierKey = getAccountTierKey(senderName);
+  const amount = generateRandomCcAmount(sendPolicy, senderTierKey);
   const requests = [];
   let shortestBlockedCooldownSeconds = 0;
   let skippedByAvoidCount = 0;
@@ -945,7 +939,6 @@ const INTERNAL_API_DEFAULTS = {
     sendCcCooldown: "/api/send/cc-cooldown",
     sendResolve: "/api/send/resolve",
     sendTransfer: "/api/send/transfer",
-    sendHistory: "/api/send/history",
     walletCcOutgoing: "/api/wallet/cc-outgoing",
     rewardsApi: "/api/rewards",
     rewardsLottery: "/api/rewards/lottery",
@@ -4161,12 +4154,6 @@ class RootsFiApiClient {
     });
   }
 
-  async getSendHistory() {
-    return this.requestJson("GET", this.paths.sendHistory, {
-      refererPath: this.paths.send
-    });
-  }
-
   async getCcOutgoing() {
     return this.requestJson("GET", this.paths.walletCcOutgoing, {
       refererPath: this.paths.send
@@ -4617,23 +4604,6 @@ async function executeCcSendFlow(client, sendRequest, config, onCheckpointRefres
     }
   }
 
-  // Step 3: Get history before transfer (for matching later)
-  stepLog("[step] Get send history (before transfer)");
-  let beforeSendIds = new Set();
-  try {
-    const beforeHistoryResponse = await apiCallWithRetry(
-      () => client.getSendHistory(),
-      "Get history (before)"
-    );
-    const beforeSends = isObject(beforeHistoryResponse.data) && Array.isArray(beforeHistoryResponse.data.sends)
-      ? beforeHistoryResponse.data.sends
-      : [];
-    beforeSendIds = new Set(beforeSends.map((item) => (isObject(item) ? item.id : null)).filter(Boolean));
-  } catch (error) {
-    console.log(`[warn] Could not get history before transfer: ${error.message}`);
-    console.log("[info] Continuing with transfer anyway...");
-  }
-
   // Step 4: Transfer CC with timeout recovery (web-like refresh + retry)
   if (!sendRequest.idempotencyKey) {
     sendRequest.idempotencyKey = crypto.randomUUID();
@@ -4766,47 +4736,17 @@ async function executeCcSendFlow(client, sendRequest, config, onCheckpointRefres
     ? String(transferData.command_result.transfer.updateId || "").trim()
     : "";
 
-  if (transferId) {
-    console.log(
-      `[info] Transfer submitted: id=${transferId}${transferUpdateId ? ` updateId=${transferUpdateId}` : ""}`
+  if (!transferId) {
+    const err = new Error(
+      `Transfer CC response missing id for ${sendRequest.label} — treating as failed submit (will retry).`
     );
+    err.isMissingTransferId = true;
+    throw err;
   }
 
-  // Step 5: Check send history (to confirm transfer)
-  stepLog("[step] Check send history");
-  let matchedSend = null;
-  try {
-    const historyResponse = await apiCallWithRetry(
-      () => client.getSendHistory(),
-      "Get history (after)"
-    );
-    const sends = isObject(historyResponse.data) && Array.isArray(historyResponse.data.sends)
-      ? historyResponse.data.sends
-      : [];
-
-    if (transferId) {
-      matchedSend = sends.find((item) => isObject(item) && item.id === transferId) || null;
-    }
-
-    if (!matchedSend) {
-      matchedSend = sends.find((item) => {
-        if (!isObject(item) || !item.id || beforeSendIds.has(item.id)) {
-          return false;
-        }
-        return String(item.direction || "").toLowerCase() === "sent" && String(item.amount || "") === sendRequest.amount;
-      }) || null;
-    }
-
-    if (matchedSend) {
-      console.log(
-        `[info] Transfer history: id=${matchedSend.id} status=${matchedSend.status ?? "unknown"} amount=${matchedSend.amount ?? sendRequest.amount} token=${matchedSend.tokenType ?? "CC"}`
-      );
-    } else {
-      console.log("[warn] Could not find a matching transfer in immediate history response.");
-    }
-  } catch (error) {
-    console.log(`[warn] Could not check history after transfer: ${error.message}`);
-  }
+  console.log(
+    `[info] Transfer submitted: id=${transferId}${transferUpdateId ? ` updateId=${transferUpdateId}` : ""}`
+  );
 
   // Step 6: Check outgoing (optional, non-fatal)
   try {
@@ -4824,8 +4764,8 @@ async function executeCcSendFlow(client, sendRequest, config, onCheckpointRefres
   }
 
   return {
-    transferId: matchedSend && matchedSend.id ? String(matchedSend.id) : transferId,
-    status: matchedSend && matchedSend.status ? String(matchedSend.status) : transferId ? "submitted" : "unknown",
+    transferId,
+    status: "submitted",
     amount: String(sendRequest.amount),
     recipient: String(sendRequest.label)
   };
@@ -6460,9 +6400,21 @@ async function processAccount(context) {
       // Guard: jangan kirim kalau tier belum diketahui (masih fallback "unranked")
       // karena amount bisa salah (terlalu kecil = tidak qualify, atau tidak sesuai rules)
       if (senderTierKey === "unranked" && !tierDisplayNameByAccount.has(account.name)) {
-  console.log(withAccountTag(accountLogTag, `[INFO] ${account.name} tier belum ada → lanjut pakai unranked`));
-  // JANGAN return, biarin lanjut
-}
+        console.log(withAccountTag(accountLogTag, `[warn] Tier belum diketahui, defer send sampai tier ter-fetch`));
+        buildDeferResult = {
+          success: true,
+          account: account.name,
+          mode: "tier-unknown-deferred",
+          deferred: true,
+          deferReason: "tier-unknown",
+          deferRetryAfterSeconds: 30,
+          deferRequiredAmount: null,
+          deferAvailableAmount: null,
+          txCompleted: 0,
+          txSkipped: 0
+        };
+        return;
+      }
 
       const senderTierRange = resolveAmountRangeForTier(sendPolicy, senderTierKey);
       const sendPolicyForSender = { ...sendPolicy, senderTier: senderTierKey };
