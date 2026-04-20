@@ -2861,7 +2861,8 @@ function normalizeConfig(rawConfig) {
 
   const captchaInput = isObject(rawConfig.captcha) ? rawConfig.captcha : {};
   const captcha = {
-    apiKey: String(captchaInput.apiKey || "").trim()
+    apiKey: String(captchaInput.apiKey || "").trim(),
+    providers: Array.isArray(captchaInput.providers) ? captchaInput.providers : []
   };
 
   const tgInput = isObject(rawConfig.telegram) ? rawConfig.telegram : {};
@@ -3403,6 +3404,61 @@ const TWOCAPTCHA_POLL_INTERVAL_MS = 5000;
 const TWOCAPTCHA_POLL_TIMEOUT_MS = 180000;
 const TWOCAPTCHA_INITIAL_WAIT_MS = 10000;
 
+function resolveCaptchaProvider(provider) {
+  if (provider.name === "multibot") {
+    return {
+      ...provider,
+      inUrl: "https://api.multibot.cloud/in.php",
+      resUrl: "https://api.multibot.cloud/res.php"
+    };
+  }
+  if (provider.name === "2captcha") {
+    return {
+      ...provider,
+      inUrl: "https://2captcha.com/in.php",
+      resUrl: "https://2captcha.com/res.php"
+    };
+  }
+  throw new Error(`Unknown captcha provider: ${provider.name}`);
+}
+
+async function solveTurnstileWithProvider(provider, sitekey, pageurl) {
+  const { name, apiKey, inUrl, resUrl } = resolveCaptchaProvider(provider);
+  const createRes = await fetch(
+    `${inUrl}?key=${apiKey}&method=turnstile&sitekey=${sitekey}&pageurl=${pageurl}`
+  );
+  const createText = await createRes.text();
+  if (!createText.startsWith("OK|")) {
+    throw new Error(`[${name}] create failed: ${createText}`);
+  }
+  const id = createText.split("|")[1];
+  for (let i = 0; i < 20; i++) {
+    await new Promise(r => setTimeout(r, 5000));
+    const res = await fetch(`${resUrl}?key=${apiKey}&action=get&id=${id}`);
+    const text = await res.text();
+    if (text === "CAPCHA_NOT_READY") continue;
+    if (text.startsWith("OK|")) {
+      return text.split("|")[1];
+    }
+    throw new Error(`[${name}] solve failed: ${text}`);
+  }
+  throw new Error(`[${name}] timeout`);
+}
+
+async function solveTurnstileWithFallback(config, sitekey, pageurl) {
+  const providers = config?.captcha?.providers || [];
+  let lastError;
+  for (const provider of providers) {
+    try {
+      return await solveTurnstileWithProvider(provider, sitekey, pageurl);
+    } catch (err) {
+      console.log(`[captcha] ${provider.name} failed → ${err.message}`);
+      lastError = err;
+    }
+  }
+  throw new Error(`All captcha providers failed: ${lastError?.message}`);
+}
+
 function isTrafficChallengeRequiredError(error) {
   if (!error) return false;
   const status = Number(error.status);
@@ -3416,70 +3472,7 @@ function isTrafficChallengeRequiredError(error) {
   );
 }
 
-async function solveTurnstileVia2Captcha(apiKey, { sitekey = TURNSTILE_SITEKEY, pageurl = TURNSTILE_PAGEURL } = {}) {
-  if (!apiKey) {
-    throw new Error("2Captcha API key missing (config.captcha.apiKey)");
-  }
 
-  const fetchFn = (typeof globalThis.fetch === "function") ? globalThis.fetch.bind(globalThis) : null;
-  if (!fetchFn) {
-    throw new Error("global fetch is not available in this Node runtime");
-  }
-
-  const submitUrl = `${TWOCAPTCHA_IN_URL}?key=${encodeURIComponent(apiKey)}`
-    + `&method=turnstile&sitekey=${encodeURIComponent(sitekey)}`
-    + `&pageurl=${encodeURIComponent(pageurl)}&json=1`;
-
-  const submitResp = await fetchFn(submitUrl, { method: "GET" });
-  const submitText = await submitResp.text();
-  let submitJson;
-  try {
-    submitJson = JSON.parse(submitText);
-  } catch {
-    throw new Error(`2Captcha in.php returned non-JSON: ${submitText.slice(0, 200)}`);
-  }
-  if (!submitJson || submitJson.status !== 1) {
-    throw new Error(`2Captcha in.php error: ${submitJson && submitJson.request ? submitJson.request : submitText.slice(0, 200)}`);
-  }
-
-  const captchaId = String(submitJson.request);
-  console.log(`[captcha] 2Captcha task submitted (id=${captchaId}). Waiting for solve...`);
-  await sleep(TWOCAPTCHA_INITIAL_WAIT_MS);
-
-  const deadline = Date.now() + TWOCAPTCHA_POLL_TIMEOUT_MS;
-  while (Date.now() < deadline) {
-    const pollUrl = `${TWOCAPTCHA_RES_URL}?key=${encodeURIComponent(apiKey)}`
-      + `&action=get&id=${encodeURIComponent(captchaId)}&json=1`;
-    const pollResp = await fetchFn(pollUrl, { method: "GET" });
-    const pollText = await pollResp.text();
-    let pollJson;
-    try {
-      pollJson = JSON.parse(pollText);
-    } catch {
-      console.log(`[captcha] poll parse error: ${pollText.slice(0, 160)}. Retrying...`);
-      await sleep(TWOCAPTCHA_POLL_INTERVAL_MS);
-      continue;
-    }
-
-    if (pollJson.status === 1) {
-      const token = String(pollJson.request || "").trim();
-      if (!token) {
-        throw new Error("2Captcha returned empty token");
-      }
-      console.log(`[captcha] Turnstile token received (len=${token.length}).`);
-      return token;
-    }
-
-    if (pollJson.request === "CAPCHA_NOT_READY") {
-      await sleep(TWOCAPTCHA_POLL_INTERVAL_MS);
-      continue;
-    }
-
-    throw new Error(`2Captcha res.php error: ${pollJson.request || pollText.slice(0, 200)}`);
-  }
-
-  throw new Error(`2Captcha timed out after ${TWOCAPTCHA_POLL_TIMEOUT_MS / 1000}s waiting for Turnstile token`);
-}
 let lastProfitabilityStatus = null;
 
 function parseNetworkRecovery(rewardsData) {
@@ -4622,7 +4615,7 @@ async function executeCcSendFlow(client, sendRequest, config, onCheckpointRefres
   }
   let challengeToken = null;
   try {
-    challengeToken = await solveTurnstileVia2Captcha(config.captcha.apiKey);
+    challengeToken = await solveTurnstileWithFallback(config, TURNSTILE_SITEKEY, TURNSTILE_PAGEURL);
     stepLog(`[captcha] Token siap, lanjut transfer dengan trafficChallengeToken.`);
     if (dashboard) {
       dashboard.setState({
@@ -4686,7 +4679,7 @@ async function executeCcSendFlow(client, sendRequest, config, onCheckpointRefres
         // Always discard old token; Turnstile tokens are single-use.
         challengeToken = null;
         try {
-          challengeToken = await solveTurnstileVia2Captcha(config.captcha.apiKey);
+          challengeToken = await solveTurnstileWithFallback(config, TURNSTILE_SITEKEY, TURNSTILE_PAGEURL);
         } catch (solveError) {
           stepLog(`[captcha] Gagal solve Turnstile: ${solveError.message}`);
           throw solveError;

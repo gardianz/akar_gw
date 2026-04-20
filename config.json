@@ -60,7 +60,16 @@
     "retryIntervalSeconds": 60
   },
   "captcha": {
-    "apiKey": ""
+    "providers": [
+    {
+      "name": "multibot",
+      "apiKey": "ISI_KEY_MULTIBOT"
+    },
+    {
+      "name": "2captcha",
+      "apiKey": "ISI_KEY_2CAPTCHA"
+    }
+  ]
   },
   "telegram": {
     "enabled": true,
