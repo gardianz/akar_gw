@@ -2173,6 +2173,9 @@ function resolveTierKey(tierDisplayName) {
 
 // Track tier displayName per account (from /api/rewards tierProgress.currentTierDisplayName)
 const tierDisplayNameByAccount = new Map();
+// Track which accounts have had /api/rewards fetched at least once in this run.
+// Used to distinguish "tier not yet fetched" vs "fetched but truly unranked".
+const tierFetchedByAccount = new Set();
 
 function getAccountTierKey(accountName) {
   const displayName = tierDisplayNameByAccount.get(accountName);
@@ -2627,6 +2630,9 @@ function normalizeConfig(rawConfig) {
 
   const sessionInput = isObject(rawConfig.session) ? rawConfig.session : {};
   const session = {
+    // Hardcoded: website migrated from Vercel Security Checkpoint to Cloudflare.
+    // No _vcrcs cookies needed anymore. Browser challenge is permanently skipped.
+    skipVercelChallenge: true,
     preflightOnboard:
       typeof sessionInput.preflightOnboard === "boolean"
         ? sessionInput.preflightOnboard
@@ -2860,9 +2866,28 @@ function normalizeConfig(rawConfig) {
   };
 
   const captchaInput = isObject(rawConfig.captcha) ? rawConfig.captcha : {};
+  const captchaProvider = String(captchaInput.provider || "self-hosted").toLowerCase().trim();
+  const validProviders = ["self-hosted", "2captcha", "multibot", "auto"];
+
+  // solverUrl supports single string or array of strings for load balancing
+  let solverUrls;
+  if (Array.isArray(captchaInput.solverUrl)) {
+    solverUrls = captchaInput.solverUrl
+      .map((u) => String(u || "").trim())
+      .filter(Boolean);
+  } else {
+    const single = String(captchaInput.solverUrl || SELFHOSTED_SOLVER_DEFAULT_URL).trim();
+    solverUrls = single ? [single] : [SELFHOSTED_SOLVER_DEFAULT_URL];
+  }
+  if (solverUrls.length === 0) {
+    solverUrls = [SELFHOSTED_SOLVER_DEFAULT_URL];
+  }
+
   const captcha = {
-    apiKey: String(captchaInput.apiKey || "").trim(),
-    providers: Array.isArray(captchaInput.providers) ? captchaInput.providers : []
+    provider: validProviders.includes(captchaProvider) ? (captchaProvider === "multibot" ? "2captcha" : captchaProvider) : "self-hosted",
+    solverUrl: solverUrls.length === 1 ? solverUrls[0] : solverUrls[0],
+    solverUrls: solverUrls,
+    apiKey: String(captchaInput.apiKey || "").trim()
   };
 
   const tgInput = isObject(rawConfig.telegram) ? rawConfig.telegram : {};
@@ -3284,6 +3309,22 @@ async function solveBrowserChallenge(baseUrl, onboardPath, userAgent, headless =
       console.log(`[browser] 429 detected, using 429 challenge mode (${probeAttempts} checks).`);
     }
 
+    // If page loaded with 200 and no challenge, cookies may already be available
+    // (Cloudflare-proxied sites don't set _vc* cookies anymore)
+    if (status === 200) {
+      const initialCookies = await page.cookies();
+      if (initialCookies.length > 0 || !response) {
+        console.log(`[browser] Page loaded with HTTP 200 — no Vercel challenge detected (${initialCookies.length} cookies). Skipping challenge poll.`);
+        // Return whatever cookies are available
+        const cookieMap = new Map();
+        for (const cookie of initialCookies) {
+          cookieMap.set(cookie.name, cookie.value);
+        }
+        cacheSecurityCookiesFromMap(cookieMap, "browser-no-challenge");
+        return cookieMap;
+      }
+    }
+
     console.log("[browser] Waiting for Vercel challenge to resolve...");
 
     for (let i = 0; i < probeAttempts; i++) {
@@ -3394,70 +3435,23 @@ function isTrafficCongestionError(error) {
 // Backend triggers this when networkRecovery is not "green": /api/send/transfer
 // returns HTTP 403 "Network is congested. A challenge must be ..." unless body
 // carries { acknowledgeTrafficWarning: true, trafficChallengeToken: <token> }.
-// We solve the Turnstile widget via 2Captcha's API (no browser required).
+//
+// Supported providers (config.captcha.provider):
+//   "self-hosted" — Turnstile-Solver lokal (GRATIS, default)
+//   "2captcha"    — 2Captcha API (berbayar, butuh apiKey)
+//   "auto"        — coba self-hosted dulu, fallback ke 2captcha jika gagal
 // ============================================================================
 const TURNSTILE_SITEKEY = "0x4AAAAAAC-oOGMu5lxFvc7w";
 const TURNSTILE_PAGEURL = "https://bridge.rootsfi.com/send";
-const TWOCAPTCHA_IN_URL = "https://2captcha.com/in.php";
-const TWOCAPTCHA_RES_URL = "https://2captcha.com/res.php";
+const TWOCAPTCHA_IN_URL = "https://api.multibot.cloud/in.php";
+const TWOCAPTCHA_RES_URL = "https://api.multibot.cloud/res.php";
 const TWOCAPTCHA_POLL_INTERVAL_MS = 5000;
 const TWOCAPTCHA_POLL_TIMEOUT_MS = 180000;
 const TWOCAPTCHA_INITIAL_WAIT_MS = 10000;
-
-function resolveCaptchaProvider(provider) {
-  if (provider.name === "multibot") {
-    return {
-      ...provider,
-      inUrl: "https://api.multibot.cloud/in.php",
-      resUrl: "https://api.multibot.cloud/res.php"
-    };
-  }
-  if (provider.name === "2captcha") {
-    return {
-      ...provider,
-      inUrl: "https://2captcha.com/in.php",
-      resUrl: "https://2captcha.com/res.php"
-    };
-  }
-  throw new Error(`Unknown captcha provider: ${provider.name}`);
-}
-
-async function solveTurnstileWithProvider(provider, sitekey, pageurl) {
-  const { name, apiKey, inUrl, resUrl } = resolveCaptchaProvider(provider);
-  const createRes = await fetch(
-    `${inUrl}?key=${apiKey}&method=turnstile&sitekey=${sitekey}&pageurl=${pageurl}`
-  );
-  const createText = await createRes.text();
-  if (!createText.startsWith("OK|")) {
-    throw new Error(`[${name}] create failed: ${createText}`);
-  }
-  const id = createText.split("|")[1];
-  for (let i = 0; i < 20; i++) {
-    await new Promise(r => setTimeout(r, 5000));
-    const res = await fetch(`${resUrl}?key=${apiKey}&action=get&id=${id}`);
-    const text = await res.text();
-    if (text === "CAPCHA_NOT_READY") continue;
-    if (text.startsWith("OK|")) {
-      return text.split("|")[1];
-    }
-    throw new Error(`[${name}] solve failed: ${text}`);
-  }
-  throw new Error(`[${name}] timeout`);
-}
-
-async function solveTurnstileWithFallback(config, sitekey, pageurl) {
-  const providers = config?.captcha?.providers || [];
-  let lastError;
-  for (const provider of providers) {
-    try {
-      return await solveTurnstileWithProvider(provider, sitekey, pageurl);
-    } catch (err) {
-      console.log(`[captcha] ${provider.name} failed → ${err.message}`);
-      lastError = err;
-    }
-  }
-  throw new Error(`All captcha providers failed: ${lastError?.message}`);
-}
+const SELFHOSTED_SOLVER_DEFAULT_URL = "http://localhost:8000";
+let _solverRoundRobinIndex = 0; // round-robin counter for multi-solver load balancing
+const SELFHOSTED_POLL_INTERVAL_MS = 2000;
+const SELFHOSTED_POLL_TIMEOUT_MS = 180000;
 
 function isTrafficChallengeRequiredError(error) {
   if (!error) return false;
@@ -3472,6 +3466,240 @@ function isTrafficChallengeRequiredError(error) {
   );
 }
 
+async function solveTurnstileVia2Captcha(apiKey, { sitekey = TURNSTILE_SITEKEY, pageurl = TURNSTILE_PAGEURL } = {}) {
+  if (!apiKey) {
+    throw new Error("Multibot API key missing (config.captcha.apiKey)");
+  }
+
+  const fetchFn = (typeof globalThis.fetch === "function") ? globalThis.fetch.bind(globalThis) : null;
+  if (!fetchFn) {
+    throw new Error("global fetch is not available in this Node runtime");
+  }
+
+  const submitUrl = `${TWOCAPTCHA_IN_URL}?key=${encodeURIComponent(apiKey)}`
+    + `&method=turnstile&sitekey=${encodeURIComponent(sitekey)}`
+    + `&pageurl=${encodeURIComponent(pageurl)}&json=1`;
+
+  const submitResp = await fetchFn(submitUrl, { method: "GET" });
+  const submitText = await submitResp.text();
+  let submitJson;
+  try {
+    submitJson = JSON.parse(submitText);
+  } catch {
+    throw new Error(`Multibot in.php returned non-JSON: ${submitText.slice(0, 200)}`);
+  }
+  if (!submitJson || submitJson.status !== 1) {
+    throw new Error(`Multibot in.php error: ${submitJson && submitJson.request ? submitJson.request : submitText.slice(0, 200)}`);
+  }
+
+  const captchaId = String(submitJson.request);
+  console.log(`[captcha] Multibot task submitted (id=${captchaId}). Waiting for solve...`);
+  await sleep(TWOCAPTCHA_INITIAL_WAIT_MS);
+
+  const deadline = Date.now() + TWOCAPTCHA_POLL_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    const pollUrl = `${TWOCAPTCHA_RES_URL}?key=${encodeURIComponent(apiKey)}`
+      + `&action=get&id=${encodeURIComponent(captchaId)}&json=1`;
+    const pollResp = await fetchFn(pollUrl, { method: "GET" });
+    const pollText = await pollResp.text();
+    let pollJson;
+    try {
+      pollJson = JSON.parse(pollText);
+    } catch {
+      console.log(`[captcha] poll parse error: ${pollText.slice(0, 160)}. Retrying...`);
+      await sleep(TWOCAPTCHA_POLL_INTERVAL_MS);
+      continue;
+    }
+
+    if (pollJson.status === 1) {
+      const token = String(pollJson.request || "").trim();
+      if (!token) {
+        throw new Error("Multibot returned empty token");
+      }
+      console.log(`[captcha] Turnstile token received (len=${token.length}).`);
+      return token;
+    }
+
+    if (pollJson.request === "CAPCHA_NOT_READY") {
+      await sleep(TWOCAPTCHA_POLL_INTERVAL_MS);
+      continue;
+    }
+
+    throw new Error(`Multibot res.php error: ${pollJson.request || pollText.slice(0, 200)}`);
+  }
+
+  throw new Error(`Multibot timed out after ${TWOCAPTCHA_POLL_TIMEOUT_MS / 1000}s waiting for Turnstile token`);
+}
+
+/**
+ * Solve Cloudflare Turnstile via self-hosted Turnstile-Solver (GRATIS).
+ * Solver harus sudah jalan di VPS: python3 api_server.py (default port 8000).
+ * Flow: POST /turnstile -> poll GET /result?id=<task_id> sampai success/error.
+ */
+async function solveTurnstileViaSelfHosted(solverBaseUrl, { sitekey = TURNSTILE_SITEKEY, pageurl = TURNSTILE_PAGEURL } = {}) {
+  const baseUrl = String(solverBaseUrl || SELFHOSTED_SOLVER_DEFAULT_URL).replace(/\/+$/, "");
+
+  const fetchFn = (typeof globalThis.fetch === "function") ? globalThis.fetch.bind(globalThis) : null;
+  if (!fetchFn) {
+    throw new Error("global fetch is not available in this Node runtime");
+  }
+
+  // Step 1: Submit task to self-hosted solver
+  const submitUrl = `${baseUrl}/turnstile?url=${encodeURIComponent(pageurl)}&sitekey=${encodeURIComponent(sitekey)}`;
+  let submitResp;
+  try {
+    submitResp = await fetchFn(submitUrl, { method: "GET", signal: AbortSignal.timeout(15000) });
+  } catch (connError) {
+    const connMsg = String(connError && connError.message ? connError.message : connError || "");
+    throw new Error(`Self-hosted solver tidak bisa dihubungi di ${baseUrl}: ${connMsg}`);
+  }
+
+  if (submitResp.status === 429) {
+    throw new Error("Self-hosted solver penuh (429), semua worker sedang sibuk. Coba lagi nanti.");
+  }
+
+  const submitText = await submitResp.text();
+  let submitJson;
+  try {
+    submitJson = JSON.parse(submitText);
+  } catch {
+    throw new Error(`Self-hosted solver returned non-JSON: ${submitText.slice(0, 200)}`);
+  }
+
+  if (!submitJson || submitJson.status !== "accepted") {
+    const errDetail = submitJson && submitJson.error ? submitJson.error : submitText.slice(0, 200);
+    throw new Error(`Self-hosted solver submit error: ${errDetail}`);
+  }
+
+  const taskId = String(submitJson.task_id || "").trim();
+  if (!taskId) {
+    throw new Error("Self-hosted solver returned empty task_id");
+  }
+
+  console.log(`[captcha] Self-hosted solver task submitted (id=${taskId.slice(0, 12)}...). Polling...`);
+
+  // Step 2: Poll for result
+  const deadline = Date.now() + SELFHOSTED_POLL_TIMEOUT_MS;
+  let pollCount = 0;
+  while (Date.now() < deadline) {
+    await sleep(SELFHOSTED_POLL_INTERVAL_MS);
+    pollCount += 1;
+
+    const pollUrl = `${baseUrl}/result?id=${encodeURIComponent(taskId)}`;
+    let pollResp;
+    try {
+      pollResp = await fetchFn(pollUrl, { method: "GET", signal: AbortSignal.timeout(10000) });
+    } catch (pollConnError) {
+      console.log(`[captcha] Self-hosted solver poll #${pollCount} connection error: ${pollConnError.message}. Retrying...`);
+      continue;
+    }
+
+    // 404 = task expired or not found
+    if (pollResp.status === 404) {
+      throw new Error(`Self-hosted solver task ${taskId.slice(0, 12)} expired atau tidak ditemukan (404)`);
+    }
+
+    const pollText = await pollResp.text();
+    let pollJson;
+    try {
+      pollJson = JSON.parse(pollText);
+    } catch {
+      console.log(`[captcha] Self-hosted solver poll #${pollCount} parse error: ${pollText.slice(0, 100)}. Retrying...`);
+      continue;
+    }
+
+    if (pollJson.status === "success") {
+      const token = String(pollJson.value || "").trim();
+      if (!token) {
+        throw new Error("Self-hosted solver returned empty token");
+      }
+      console.log(`[captcha] Turnstile token received via self-hosted solver (len=${token.length}, ${pollCount} polls).`);
+      return token;
+    }
+
+    if (pollJson.status === "error") {
+      const errValue = String(pollJson.value || pollJson.message || "unknown");
+      throw new Error(`Self-hosted solver error: ${errValue}`);
+    }
+
+    // status === "process" -> masih solving, lanjut poll
+    if (pollCount % 10 === 0) {
+      console.log(`[captcha] Self-hosted solver masih solving... (poll #${pollCount})`);
+    }
+  }
+
+  throw new Error(`Self-hosted solver timed out after ${SELFHOSTED_POLL_TIMEOUT_MS / 1000}s (${pollCount} polls)`);
+}
+
+/**
+ * Smart captcha solver wrapper — auto-selects provider based on config.
+ * Supports multiple solver URLs with round-robin load balancing.
+ * Provider options: "self-hosted" (default, gratis), "2captcha" (berbayar), "auto" (coba self-hosted dulu).
+ */
+async function solveTurnstile(captchaConfig) {
+  const provider = String(captchaConfig && captchaConfig.provider || "self-hosted").toLowerCase().trim();
+  const solverUrls = Array.isArray(captchaConfig && captchaConfig.solverUrls) && captchaConfig.solverUrls.length > 0
+    ? captchaConfig.solverUrls
+    : [String(captchaConfig && captchaConfig.solverUrl || SELFHOSTED_SOLVER_DEFAULT_URL).trim()];
+  const apiKey = String(captchaConfig && captchaConfig.apiKey || "").trim();
+
+  if (provider === "2captcha") {
+    if (!apiKey) {
+      throw new Error("Provider multibot/2captcha dipilih tapi config.captcha.apiKey kosong!");
+    }
+    console.log("[captcha] Solving Turnstile via Multibot...");
+    return solveTurnstileVia2Captcha(apiKey);
+  }
+
+  if (provider === "self-hosted") {
+    // Round-robin across multiple solver URLs
+    const errors = [];
+    for (let i = 0; i < solverUrls.length; i++) {
+      const idx = (_solverRoundRobinIndex + i) % solverUrls.length;
+      const url = solverUrls[idx];
+      try {
+        console.log(`[captcha] Solving via self-hosted solver [${idx + 1}/${solverUrls.length}] (${url})...`);
+        const token = await solveTurnstileViaSelfHosted(url);
+        _solverRoundRobinIndex = (idx + 1) % solverUrls.length;
+        return token;
+      } catch (err) {
+        console.log(`[captcha] Solver [${idx + 1}] (${url}) gagal: ${err.message}`);
+        errors.push({ url, error: err });
+      }
+    }
+    // All solvers failed
+    const lastErr = errors.length > 0 ? errors[errors.length - 1].error : new Error("No solver URLs configured");
+    throw lastErr;
+  }
+
+  if (provider === "auto") {
+    // Coba semua self-hosted dulu (round-robin), fallback ke 2captcha
+    const errors = [];
+    for (let i = 0; i < solverUrls.length; i++) {
+      const idx = (_solverRoundRobinIndex + i) % solverUrls.length;
+      const url = solverUrls[idx];
+      try {
+        console.log(`[captcha] [auto] Mencoba solver [${idx + 1}/${solverUrls.length}] (${url})...`);
+        const token = await solveTurnstileViaSelfHosted(url);
+        _solverRoundRobinIndex = (idx + 1) % solverUrls.length;
+        return token;
+      } catch (err) {
+        console.log(`[captcha] [auto] Solver [${idx + 1}] (${url}) gagal: ${err.message}`);
+        errors.push({ url, error: err });
+      }
+    }
+    // All self-hosted failed, try Multibot fallback
+    if (apiKey) {
+      console.log("[captcha] [auto] Semua self-hosted gagal. Fallback ke Multibot...");
+      return solveTurnstileVia2Captcha(apiKey);
+    }
+    console.log("[captcha] [auto] Semua solver gagal, tidak ada fallback Multibot.");
+    const lastErr = errors.length > 0 ? errors[errors.length - 1].error : new Error("No solver URLs configured");
+    throw lastErr;
+  }
+
+  throw new Error(`Provider captcha tidak dikenal: "${provider}". Gunakan: "self-hosted", "2captcha", atau "auto".`);
+}
 
 let lastProfitabilityStatus = null;
 
@@ -4615,7 +4843,7 @@ async function executeCcSendFlow(client, sendRequest, config, onCheckpointRefres
   }
   let challengeToken = null;
   try {
-    challengeToken = await solveTurnstileWithFallback(config, TURNSTILE_SITEKEY, TURNSTILE_PAGEURL);
+    challengeToken = await solveTurnstile(config.captcha);
     stepLog(`[captcha] Token siap, lanjut transfer dengan trafficChallengeToken.`);
     if (dashboard) {
       dashboard.setState({
@@ -4679,7 +4907,7 @@ async function executeCcSendFlow(client, sendRequest, config, onCheckpointRefres
         // Always discard old token; Turnstile tokens are single-use.
         challengeToken = null;
         try {
-          challengeToken = await solveTurnstileWithFallback(config, TURNSTILE_SITEKEY, TURNSTILE_PAGEURL);
+          challengeToken = await solveTurnstile(config.captcha);
         } catch (solveError) {
           stepLog(`[captcha] Gagal solve Turnstile: ${solveError.message}`);
           throw solveError;
@@ -4729,17 +4957,11 @@ async function executeCcSendFlow(client, sendRequest, config, onCheckpointRefres
     ? String(transferData.command_result.transfer.updateId || "").trim()
     : "";
 
-  if (!transferId) {
-    const err = new Error(
-      `Transfer CC response missing id for ${sendRequest.label} — treating as failed submit (will retry).`
+  if (transferId) {
+    console.log(
+      `[info] Transfer submitted: id=${transferId}${transferUpdateId ? ` updateId=${transferUpdateId}` : ""}`
     );
-    err.isMissingTransferId = true;
-    throw err;
   }
-
-  console.log(
-    `[info] Transfer submitted: id=${transferId}${transferUpdateId ? ` updateId=${transferUpdateId}` : ""}`
-  );
 
   // Step 6: Check outgoing (optional, non-fatal)
   try {
@@ -4758,7 +4980,7 @@ async function executeCcSendFlow(client, sendRequest, config, onCheckpointRefres
 
   return {
     transferId,
-    status: "submitted",
+    status: transferId ? "submitted" : "unknown",
     amount: String(sendRequest.amount),
     recipient: String(sendRequest.label)
   };
@@ -4994,6 +5216,11 @@ async function refreshThisWeekRewardDashboard(client, dashboard, accountLogTag =
 
     // Extract tier min qualifying send amount + quality score
     const data = isObject(rewardsResponse && rewardsResponse.data) ? rewardsResponse.data : {};
+    if (accountName) {
+      // Mark tier fetch as completed for this account (even if truly unranked
+      // with no displayName, so the send-guard can proceed).
+      tierFetchedByAccount.add(accountName);
+    }
     if (isObject(data.tierProgress) && accountName) {
       const tierMin = Number(data.tierProgress.currentTier && data.tierProgress.currentTier.minCcWholeTokensPerQualifyingSend);
       const tierDisplayName = String(data.tierProgress.currentTierDisplayName || "").trim();
@@ -5713,6 +5940,17 @@ async function executeSendBatch(client, sendRequests, config, dashboard, onCheck
 }
 
 async function refreshVercelSecurityCookies(client, config, reasonLabel, onCheckpointRefresh) {
+  // Skip browser challenge entirely if website no longer uses Vercel Security Checkpoint
+  if (true /* skipVercelChallenge: website migrated to Cloudflare */) {
+    console.log(`[info] ${reasonLabel} — SKIPPED (skipVercelChallenge=true, website uses Cloudflare now)`);
+    return {
+      refreshed: true,
+      unavailable: false,
+      retryAfterSeconds: 0,
+      reason: "skipped-no-vercel-challenge"
+    };
+  }
+
   console.log(`[info] ${reasonLabel}`);
   const hadSecurityCookie = client.hasSecurityCookie();
   const hadSessionCookie = client.hasAccountSessionCookie();
@@ -6390,10 +6628,11 @@ async function processAccount(context) {
     const buildSendRequestsNow = () => {
       const senderTierKey = getAccountTierKey(account.name);
 
-      // Guard: jangan kirim kalau tier belum diketahui (masih fallback "unranked")
-      // karena amount bisa salah (terlalu kecil = tidak qualify, atau tidak sesuai rules)
-      if (senderTierKey === "unranked" && !tierDisplayNameByAccount.has(account.name)) {
-        console.log(withAccountTag(accountLogTag, `[warn] Tier belum diketahui, defer send sampai tier ter-fetch`));
+      // Guard: defer ONLY if /api/rewards belum pernah berhasil di-fetch untuk akun ini.
+      // Kalau sudah fetched tapi tetap unranked (akun baru / belum ada qualifying send),
+      // tetap lanjut TX pakai amount range "unranked" dari config.
+      if (!tierFetchedByAccount.has(account.name)) {
+        console.log(withAccountTag(accountLogTag, `[warn] Tier belum di-fetch, defer send sampai /api/rewards sukses`));
         buildDeferResult = {
           success: true,
           account: account.name,
@@ -6541,7 +6780,8 @@ async function processAccount(context) {
       }
     }
 
-    if (shouldRefreshVercelCookie(lastVercelRefreshAt, accountConfig.session.proactiveVercelRefreshMinutes)) {
+    // skipVercelChallenge: website migrated to Cloudflare, proactive refresh permanently disabled
+    if (false && shouldRefreshVercelCookie(lastVercelRefreshAt, accountConfig.session.proactiveVercelRefreshMinutes)) {
       dashboard.setState({ phase: "vercel-refresh" });
       console.log(
         withAccountTag(
@@ -6564,17 +6804,24 @@ async function processAccount(context) {
     }
 
     if (!client.hasValidSession()) {
-      dashboard.setState({ phase: "browser-checkpoint" });
-      console.log("[info] No valid session cookies found, launching browser...");
-      await refreshVercelSecurityCookies(
-        client,
-        accountConfig,
-        "Initial browser verification required",
-        markCheckpointRefresh
-      );
-      console.log("[info] Browser cookies merged from challenge flow");
-      client.logCookieStatus("after browser merge");
-      updateCookieDashboard(client);
+      if (true /* skipVercelChallenge: Cloudflare */) {
+        // Website no longer uses Vercel checkpoint — skip browser challenge.
+        // Session will be established via OTP or session reuse without _vcrcs.
+        console.log("[info] No valid session cookies found — Vercel challenge skipped (website uses Cloudflare)");
+        console.log("[info] Will proceed to session reuse or OTP flow directly.");
+      } else {
+        dashboard.setState({ phase: "browser-checkpoint" });
+        console.log("[info] No valid session cookies found, launching browser...");
+        await refreshVercelSecurityCookies(
+          client,
+          accountConfig,
+          "Initial browser verification required",
+          markCheckpointRefresh
+        );
+        console.log("[info] Browser cookies merged from challenge flow");
+        client.logCookieStatus("after browser merge");
+        updateCookieDashboard(client);
+      }
     } else {
       console.log("[info] Using existing session cookies from tokens.json");
     }
@@ -7471,6 +7718,55 @@ async function runDailyCycle(context) {
   console.log(`[cycle] Profitability gate: allowedModes=${(config.profitability.allowedModes || []).join("/")} | retryInterval=${config.profitability.retryIntervalSeconds}s`);
   console.log(`${"#".repeat(70)}\n`);
 
+  // Balance-only fast path: login + print balance per account, no scheduler/TX.
+  if (sendMode === "balance-only") {
+    const boResults = [];
+    const boSnapshots = {};
+    for (let i = 0; i < sortedAccounts.length; i++) {
+      const account = sortedAccounts[i];
+      const accountToken = tokens.accounts[account.name] || normalizeTokenProfile({});
+      tokens.accounts[account.name] = accountToken;
+      try {
+        const result = await processAccount({
+          account,
+          accountToken,
+          config,
+          tokens,
+          tokensPath,
+          sendMode,
+          recipientsInfo,
+          args,
+          accountIndex: i,
+          totalAccounts: sortedAccounts.length,
+          selectedAccounts: sortedAccounts,
+          accountSnapshots: boSnapshots,
+          loopRound: 1,
+          totalLoopRounds: 1,
+          maxLoopTxOverride: 0,
+          smartFillBlockRecipients: [],
+          resumeFromDeferReason: "",
+          preferRecipientNames: []
+        });
+        boResults.push(result);
+      } catch (error) {
+        console.error(`[error] ${account.name}: ${error.message}`);
+        boResults.push({ success: false, account: account.name, error: error.message });
+      }
+    }
+    if (!args.dryRun) {
+      try { await saveTokensSerial(tokensPath, tokens); } catch (err) {
+        console.warn(`[warn] Failed to persist tokens: ${err.message}`);
+      }
+    }
+    const cycleEndTime = new Date();
+    return {
+      results: boResults,
+      successful: boResults.filter((r) => r && r.success && !r.deferred),
+      failed: boResults.filter((r) => r && !r.success),
+      cycleDuration: cycleEndTime - cycleStartTime
+    };
+  }
+
   const results = [];
   const accountSnapshots = {};
   const inFlight = new Set();
@@ -7857,13 +8153,17 @@ async function runOtpOnlyFlow(context) {
     const client = new RootsFiApiClient(accountConfig);
 
     try {
-      console.log(`[step] ${tag}: Browser challenge (ambil _vcrcs)`);
-      await refreshVercelSecurityCookies(
-        client,
-        accountConfig,
-        `OTP-mode fresh browser challenge (${account.name})`,
-        markCheckpointRefresh
-      );
+      if (true /* skipVercelChallenge: Cloudflare */) {
+        console.log(`[step] ${tag}: Browser challenge skipped (website uses Cloudflare)`);
+      } else {
+        console.log(`[step] ${tag}: Browser challenge (ambil _vcrcs)`);
+        await refreshVercelSecurityCookies(
+          client,
+          accountConfig,
+          `OTP-mode fresh browser challenge (${account.name})`,
+          markCheckpointRefresh
+        );
+      }
 
       console.log(`[step] ${tag}: Send OTP ke ${maskEmail(selectedEmail)}`);
       const sendOtpResponse = await sendOtpWithCheckpointRecovery(

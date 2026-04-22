@@ -1,24 +1,24 @@
 {
   "send": {
-    "workers": 17,
+    "workers": 20,
     "maxLoopTx": 10000,
-    "minDelayTxSeconds": 60,
-    "maxDelayTxSeconds": 100,
+    "minDelayTxSeconds": 20,
+    "maxDelayTxSeconds": 30,
     "hourlyMaxTx": 10,
     "tierAmounts": {
       "unranked": {
-        "min": "10",
-        "max": "100",
+        "min": "100",
+        "max": "105",
         "decimals": 3
       },
       "newbie": {
-        "min": "10",
-        "max": "110",
+        "min": "100",
+        "max": "105",
         "decimals": 3
       },
       "advanced": {
-        "min": "25",
-        "max": "110",
+        "min": "100",
+        "max": "105",
         "decimals": 3
       },
       "pro": {
@@ -46,11 +46,11 @@
   },
   "ui": {
     "dashboard": true,
-    "logLines": 30
+    "logLines": 20
   },
   "safety": {
     "minScoreThreshold": 0,
-    "minHoldBalanceCc": 5
+    "minHoldBalanceCc": 10
   },
   "profitability": {
     "allowedModes": [
@@ -60,19 +60,12 @@
     "retryIntervalSeconds": 60
   },
   "captcha": {
-    "providers": [
-    {
-      "name": "multibot",
-      "apiKey": "ISI_KEY_MULTIBOT"
-    },
-    {
-      "name": "2captcha",
-      "apiKey": "ISI_KEY_2CAPTCHA"
-    }
-  ]
+    "provider": "self-hosted",
+    "solverUrl": "http://174.138.26.61:8000",
+    "apiKey": ""
   },
   "telegram": {
-    "enabled": true,
+    "enabled": false,
     "botToken": "",
     "allowedChatIds": [],
     "autoReport": {
