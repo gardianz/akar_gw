@@ -2630,9 +2630,6 @@ function normalizeConfig(rawConfig) {
 
   const sessionInput = isObject(rawConfig.session) ? rawConfig.session : {};
   const session = {
-    // Hardcoded: website migrated from Vercel Security Checkpoint to Cloudflare.
-    // No _vcrcs cookies needed anymore. Browser challenge is permanently skipped.
-    skipVercelChallenge: true,
     preflightOnboard:
       typeof sessionInput.preflightOnboard === "boolean"
         ? sessionInput.preflightOnboard
@@ -2867,7 +2864,7 @@ function normalizeConfig(rawConfig) {
 
   const captchaInput = isObject(rawConfig.captcha) ? rawConfig.captcha : {};
   const captchaProvider = String(captchaInput.provider || "self-hosted").toLowerCase().trim();
-  const validProviders = ["self-hosted", "2captcha", "multibot", "auto"];
+  const validProviders = ["self-hosted", "2captcha", "auto"];
 
   // solverUrl supports single string or array of strings for load balancing
   let solverUrls;
@@ -2884,7 +2881,7 @@ function normalizeConfig(rawConfig) {
   }
 
   const captcha = {
-    provider: validProviders.includes(captchaProvider) ? (captchaProvider === "multibot" ? "2captcha" : captchaProvider) : "self-hosted",
+    provider: validProviders.includes(captchaProvider) ? captchaProvider : "self-hosted",
     solverUrl: solverUrls.length === 1 ? solverUrls[0] : solverUrls[0],
     solverUrls: solverUrls,
     apiKey: String(captchaInput.apiKey || "").trim()
@@ -3309,22 +3306,6 @@ async function solveBrowserChallenge(baseUrl, onboardPath, userAgent, headless =
       console.log(`[browser] 429 detected, using 429 challenge mode (${probeAttempts} checks).`);
     }
 
-    // If page loaded with 200 and no challenge, cookies may already be available
-    // (Cloudflare-proxied sites don't set _vc* cookies anymore)
-    if (status === 200) {
-      const initialCookies = await page.cookies();
-      if (initialCookies.length > 0 || !response) {
-        console.log(`[browser] Page loaded with HTTP 200 — no Vercel challenge detected (${initialCookies.length} cookies). Skipping challenge poll.`);
-        // Return whatever cookies are available
-        const cookieMap = new Map();
-        for (const cookie of initialCookies) {
-          cookieMap.set(cookie.name, cookie.value);
-        }
-        cacheSecurityCookiesFromMap(cookieMap, "browser-no-challenge");
-        return cookieMap;
-      }
-    }
-
     console.log("[browser] Waiting for Vercel challenge to resolve...");
 
     for (let i = 0; i < probeAttempts; i++) {
@@ -3443,8 +3424,8 @@ function isTrafficCongestionError(error) {
 // ============================================================================
 const TURNSTILE_SITEKEY = "0x4AAAAAAC-oOGMu5lxFvc7w";
 const TURNSTILE_PAGEURL = "https://bridge.rootsfi.com/send";
-const TWOCAPTCHA_IN_URL = "https://api.multibot.cloud/in.php";
-const TWOCAPTCHA_RES_URL = "https://api.multibot.cloud/res.php";
+const TWOCAPTCHA_IN_URL = "https://2captcha.com/in.php";
+const TWOCAPTCHA_RES_URL = "https://2captcha.com/res.php";
 const TWOCAPTCHA_POLL_INTERVAL_MS = 5000;
 const TWOCAPTCHA_POLL_TIMEOUT_MS = 180000;
 const TWOCAPTCHA_INITIAL_WAIT_MS = 10000;
@@ -3468,7 +3449,7 @@ function isTrafficChallengeRequiredError(error) {
 
 async function solveTurnstileVia2Captcha(apiKey, { sitekey = TURNSTILE_SITEKEY, pageurl = TURNSTILE_PAGEURL } = {}) {
   if (!apiKey) {
-    throw new Error("Multibot API key missing (config.captcha.apiKey)");
+    throw new Error("2Captcha API key missing (config.captcha.apiKey)");
   }
 
   const fetchFn = (typeof globalThis.fetch === "function") ? globalThis.fetch.bind(globalThis) : null;
@@ -3486,14 +3467,14 @@ async function solveTurnstileVia2Captcha(apiKey, { sitekey = TURNSTILE_SITEKEY, 
   try {
     submitJson = JSON.parse(submitText);
   } catch {
-    throw new Error(`Multibot in.php returned non-JSON: ${submitText.slice(0, 200)}`);
+    throw new Error(`2Captcha in.php returned non-JSON: ${submitText.slice(0, 200)}`);
   }
   if (!submitJson || submitJson.status !== 1) {
-    throw new Error(`Multibot in.php error: ${submitJson && submitJson.request ? submitJson.request : submitText.slice(0, 200)}`);
+    throw new Error(`2Captcha in.php error: ${submitJson && submitJson.request ? submitJson.request : submitText.slice(0, 200)}`);
   }
 
   const captchaId = String(submitJson.request);
-  console.log(`[captcha] Multibot task submitted (id=${captchaId}). Waiting for solve...`);
+  console.log(`[captcha] 2Captcha task submitted (id=${captchaId}). Waiting for solve...`);
   await sleep(TWOCAPTCHA_INITIAL_WAIT_MS);
 
   const deadline = Date.now() + TWOCAPTCHA_POLL_TIMEOUT_MS;
@@ -3514,7 +3495,7 @@ async function solveTurnstileVia2Captcha(apiKey, { sitekey = TURNSTILE_SITEKEY, 
     if (pollJson.status === 1) {
       const token = String(pollJson.request || "").trim();
       if (!token) {
-        throw new Error("Multibot returned empty token");
+        throw new Error("2Captcha returned empty token");
       }
       console.log(`[captcha] Turnstile token received (len=${token.length}).`);
       return token;
@@ -3525,10 +3506,10 @@ async function solveTurnstileVia2Captcha(apiKey, { sitekey = TURNSTILE_SITEKEY, 
       continue;
     }
 
-    throw new Error(`Multibot res.php error: ${pollJson.request || pollText.slice(0, 200)}`);
+    throw new Error(`2Captcha res.php error: ${pollJson.request || pollText.slice(0, 200)}`);
   }
 
-  throw new Error(`Multibot timed out after ${TWOCAPTCHA_POLL_TIMEOUT_MS / 1000}s waiting for Turnstile token`);
+  throw new Error(`2Captcha timed out after ${TWOCAPTCHA_POLL_TIMEOUT_MS / 1000}s waiting for Turnstile token`);
 }
 
 /**
@@ -3645,9 +3626,9 @@ async function solveTurnstile(captchaConfig) {
 
   if (provider === "2captcha") {
     if (!apiKey) {
-      throw new Error("Provider multibot/2captcha dipilih tapi config.captcha.apiKey kosong!");
+      throw new Error("Provider 2captcha dipilih tapi config.captcha.apiKey kosong!");
     }
-    console.log("[captcha] Solving Turnstile via Multibot...");
+    console.log("[captcha] Solving Turnstile via 2Captcha (berbayar)...");
     return solveTurnstileVia2Captcha(apiKey);
   }
 
@@ -3688,12 +3669,12 @@ async function solveTurnstile(captchaConfig) {
         errors.push({ url, error: err });
       }
     }
-    // All self-hosted failed, try Multibot fallback
+    // All self-hosted failed, try 2captcha fallback
     if (apiKey) {
-      console.log("[captcha] [auto] Semua self-hosted gagal. Fallback ke Multibot...");
+      console.log("[captcha] [auto] Semua self-hosted gagal. Fallback ke 2Captcha...");
       return solveTurnstileVia2Captcha(apiKey);
     }
-    console.log("[captcha] [auto] Semua solver gagal, tidak ada fallback Multibot.");
+    console.log("[captcha] [auto] Semua solver gagal, tidak ada fallback 2Captcha.");
     const lastErr = errors.length > 0 ? errors[errors.length - 1].error : new Error("No solver URLs configured");
     throw lastErr;
   }
@@ -5940,17 +5921,6 @@ async function executeSendBatch(client, sendRequests, config, dashboard, onCheck
 }
 
 async function refreshVercelSecurityCookies(client, config, reasonLabel, onCheckpointRefresh) {
-  // Skip browser challenge entirely if website no longer uses Vercel Security Checkpoint
-  if (true /* skipVercelChallenge: website migrated to Cloudflare */) {
-    console.log(`[info] ${reasonLabel} — SKIPPED (skipVercelChallenge=true, website uses Cloudflare now)`);
-    return {
-      refreshed: true,
-      unavailable: false,
-      retryAfterSeconds: 0,
-      reason: "skipped-no-vercel-challenge"
-    };
-  }
-
   console.log(`[info] ${reasonLabel}`);
   const hadSecurityCookie = client.hasSecurityCookie();
   const hadSessionCookie = client.hasAccountSessionCookie();
@@ -6780,8 +6750,7 @@ async function processAccount(context) {
       }
     }
 
-    // skipVercelChallenge: website migrated to Cloudflare, proactive refresh permanently disabled
-    if (false && shouldRefreshVercelCookie(lastVercelRefreshAt, accountConfig.session.proactiveVercelRefreshMinutes)) {
+    if (shouldRefreshVercelCookie(lastVercelRefreshAt, accountConfig.session.proactiveVercelRefreshMinutes)) {
       dashboard.setState({ phase: "vercel-refresh" });
       console.log(
         withAccountTag(
@@ -6804,24 +6773,17 @@ async function processAccount(context) {
     }
 
     if (!client.hasValidSession()) {
-      if (true /* skipVercelChallenge: Cloudflare */) {
-        // Website no longer uses Vercel checkpoint — skip browser challenge.
-        // Session will be established via OTP or session reuse without _vcrcs.
-        console.log("[info] No valid session cookies found — Vercel challenge skipped (website uses Cloudflare)");
-        console.log("[info] Will proceed to session reuse or OTP flow directly.");
-      } else {
-        dashboard.setState({ phase: "browser-checkpoint" });
-        console.log("[info] No valid session cookies found, launching browser...");
-        await refreshVercelSecurityCookies(
-          client,
-          accountConfig,
-          "Initial browser verification required",
-          markCheckpointRefresh
-        );
-        console.log("[info] Browser cookies merged from challenge flow");
-        client.logCookieStatus("after browser merge");
-        updateCookieDashboard(client);
-      }
+      dashboard.setState({ phase: "browser-checkpoint" });
+      console.log("[info] No valid session cookies found, launching browser...");
+      await refreshVercelSecurityCookies(
+        client,
+        accountConfig,
+        "Initial browser verification required",
+        markCheckpointRefresh
+      );
+      console.log("[info] Browser cookies merged from challenge flow");
+      client.logCookieStatus("after browser merge");
+      updateCookieDashboard(client);
     } else {
       console.log("[info] Using existing session cookies from tokens.json");
     }
@@ -8153,17 +8115,13 @@ async function runOtpOnlyFlow(context) {
     const client = new RootsFiApiClient(accountConfig);
 
     try {
-      if (true /* skipVercelChallenge: Cloudflare */) {
-        console.log(`[step] ${tag}: Browser challenge skipped (website uses Cloudflare)`);
-      } else {
-        console.log(`[step] ${tag}: Browser challenge (ambil _vcrcs)`);
-        await refreshVercelSecurityCookies(
-          client,
-          accountConfig,
-          `OTP-mode fresh browser challenge (${account.name})`,
-          markCheckpointRefresh
-        );
-      }
+      console.log(`[step] ${tag}: Browser challenge (ambil _vcrcs)`);
+      await refreshVercelSecurityCookies(
+        client,
+        accountConfig,
+        `OTP-mode fresh browser challenge (${account.name})`,
+        markCheckpointRefresh
+      );
 
       console.log(`[step] ${tag}: Send OTP ke ${maskEmail(selectedEmail)}`);
       const sendOtpResponse = await sendOtpWithCheckpointRecovery(
