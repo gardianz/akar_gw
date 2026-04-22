@@ -54,7 +54,7 @@ C) recipient.txt — hanya untuk mode external, satu alamat per baris
 
 [4] SETUP CAPTCHA SOLVER (WAJIB!)
 ----------------------------------
-Bot butuh captcha solver. Ada 3 pilihan:
+Bot butuh captcha solver. Ada 4 pilihan:
 
   A) SELF-HOSTED (GRATIS — DISARANKAN)
   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -93,6 +93,39 @@ Bot butuh captcha solver. Ada 3 pilihan:
     source venv/bin/activate
     xvfb-run -a python3 api_server.py --yes
     (Ctrl+A lalu D untuk detach, screen -r solver untuk kembali)
+
+  B) 2CAPTCHA (BERBAYAR)
+  ~~~~~~~~~~~~~~~~~~~~~~
+  Cocok kalau tidak mau setup solver sendiri.
+
+  config.json:
+    "captcha": {
+      "provider": "2captcha",
+      "apiKey": "API_KEY_2CAPTCHA"
+    }
+
+  C) MULTIBOT (BERBAYAR)
+  ~~~~~~~~~~~~~~~~~~~~~~
+  Format mirip 2captcha, tapi pakai API key Multibot.
+
+  config.json:
+    "captcha": {
+      "provider": "multibot",
+      "apiKey": "API_KEY_MULTIBOT"
+    }
+
+  D) AUTO (SELF-HOSTED -> REMOTE FALLBACK)
+  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  Bot akan coba self-hosted dulu. Kalau gagal, bot fallback ke provider remote.
+  Default fallback = 2captcha. Bisa diganti ke multibot.
+
+  config.json:
+    "captcha": {
+      "provider": "auto",
+      "solverUrl": "http://IP_SOLVER:8000",
+      "fallbackProvider": "multibot",
+      "apiKey": "API_KEY_REMOTE"
+    }
 
 
 [6] TELEGRAM NOTIFIKASI (OPSIONAL)
