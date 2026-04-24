@@ -62,7 +62,7 @@ function trackBrowserPid(browser) {
       trackedBrowserPids.add(proc.pid);
       return proc.pid;
     }
-  } catch {}
+  } catch { }
   return null;
 }
 
@@ -465,8 +465,8 @@ function buildInternalSendRequests(
   const avoidRecipientsSet = new Set(
     Array.isArray(avoidRecipientNames)
       ? avoidRecipientNames
-          .map((item) => String(item || "").trim())
-          .filter((item) => Boolean(item))
+        .map((item) => String(item || "").trim())
+        .filter((item) => Boolean(item))
       : []
   );
 
@@ -534,6 +534,7 @@ function buildInternalSendRequests(
       amount,
       label: recipient.name,
       address: recipient.address,
+      username: getAccountUsername(recipient.name) || null,
       source: "internal-rotating",
       offset,
       internalRecipientCandidate: true
@@ -713,6 +714,28 @@ function updateAccountCcBalance(accountName, ccNumeric) {
 function getAccountCcBalance(accountName) {
   const entry = latestCcBalanceByAccount.get(String(accountName || "").trim());
   return entry ? entry.cc : null;
+}
+
+// ============================================================================
+// GLOBAL USERNAME CACHE
+// ============================================================================
+// Caches resolved Roots usernames per account (from login or /api/send/resolve).
+// RootsFi now requires username-based transfers (recipientType: "user") instead
+// of Canton address-based ones (recipientType: "canton_wallet"). This cache
+// avoids redundant resolve API calls after the first successful resolution.
+// ============================================================================
+
+const cachedUsernameByAccount = new Map();
+
+function updateAccountUsername(accountName, username) {
+  const name = String(accountName || "").trim();
+  const user = String(username || "").trim();
+  if (!name || !user) return;
+  cachedUsernameByAccount.set(name, user);
+}
+
+function getAccountUsername(accountName) {
+  return cachedUsernameByAccount.get(String(accountName || "").trim()) || null;
 }
 
 /**
@@ -946,6 +969,7 @@ const INTERNAL_API_DEFAULTS = {
     sendLimits: "/api/send/limits",
     recipientPreview: "/api/send/recipient-preview",
     walletOffers: "/api/wallet/offers",
+    walletOffersAccept: "/api/wallet/offers/accept",
     marketOtcPythPanel: "/api/market/otc-pyth-panel"
   },
   headers: {
@@ -978,11 +1002,11 @@ const INTERNAL_API_DEFAULTS = {
     sequentialAllRounds: true,
     workers: 1,
     tierAmounts: {
-      unranked: { min: "10", max: "25",  decimals: 2 },
-      newbie:   { min: "10", max: "25",  decimals: 2 },
-      advanced: { min: "25", max: "50",  decimals: 2 },
-      pro:      { min: "50", max: "100", decimals: 2 },
-      elite:    { min: "100", max: "200", decimals: 2 }
+      unranked: { min: "10", max: "25", decimals: 2 },
+      newbie: { min: "10", max: "25", decimals: 2 },
+      advanced: { min: "25", max: "50", decimals: 2 },
+      pro: { min: "50", max: "100", decimals: 2 },
+      elite: { min: "100", max: "200", decimals: 2 }
     }
   },
   ui: {
@@ -1295,114 +1319,270 @@ class PinnedDashboard {
       timeZone: "Asia/Jakarta"
     });
     const rows = this.parseAccountRows();
-    const accountCount = rows.length;
-    const terminalWidth = Number(process.stdout.columns || 132);
-    const frameWidth = Math.max(142, Math.min(210, terminalWidth));
-    const contentWidth = frameWidth - 4;
+    const W = Math.max(40, Number(process.stdout.columns || 48));
     const modeLabel = String(this.state.mode || "-").toUpperCase();
-    const topBorder = `+${"=".repeat(frameWidth - 2)}+`;
-    const midBorder = `+${"-".repeat(frameWidth - 2)}+`;
-    const bannerLine = (text) => `| ${this.formatCell(text, contentWidth)} |`;
 
-    // Dynamic table: 8 columns, auto-resize based on terminal width
-    const fixedCols = {
-      akun: 14,
-      status: 9,
-      cc: 10,
-      txProgress: 20,
-      rewardsWeek: 22,
-      rewardsDiff: 22,
+    // ANSI helpers
+    const C = {
+      rst: "\x1b[0m", bold: "\x1b[1m", dim: "\x1b[2m",
+      cyan: "\x1b[36m", green: "\x1b[32m", yellow: "\x1b[33m",
+      red: "\x1b[31m", magenta: "\x1b[35m", white: "\x1b[97m",
+      blue: "\x1b[34m",
     };
-    const columnCount = 8;
-    const separatorWidth = 3 * (columnCount - 1); // " | " between columns
-    const fixedTotal = fixedCols.akun + fixedCols.status + fixedCols.cc + fixedCols.txProgress + fixedCols.rewardsWeek + fixedCols.rewardsDiff;
-    const flexTotal = Math.max(40, contentWidth - separatorWidth - fixedTotal);
-    // Distribute flex space: Send Plan 55%, Score 45%
-    const sendPlanWidth = Math.max(16, Math.floor(flexTotal * 0.55));
-    const scoreWidth = Math.max(22, flexTotal - sendPlanWidth);
-    const tableWidths = [fixedCols.akun, fixedCols.status, fixedCols.cc, fixedCols.txProgress, sendPlanWidth, scoreWidth, fixedCols.rewardsWeek, fixedCols.rewardsDiff];
-    const tableRow = (cells) => `| ${cells.map((cell, idx) => this.formatCell(String(cell || "-"), tableWidths[idx] || 10)).join(" | ")} |`;
-    const tableRule = (char) => `| ${tableWidths.map((width) => char.repeat(width)).join(" | ")} |`;
 
-    const lines = [];
-    lines.push(topBorder);
-    lines.push(
-      bannerLine(
-        `RootFiBot Auto-Send V1  |  ${now} WIB  |  ${accountCount} akun  |  Mode: ${modeLabel}`
-      )
+    // Strip ANSI codes for visible-length calculation
+    const stripAnsi = (s) => String(s).replace(/\x1b\[[0-9;]*m/g, "");
+
+    // Fit text to exact visible width, ANSI-aware truncation
+    const fitCell = (text, width) => {
+      const str = String(text || "");
+      const vis = stripAnsi(str);
+      if (vis.length <= width) return str + " ".repeat(width - vis.length);
+      let result = "", vc = 0, inEsc = false;
+      for (let i = 0; i < str.length && vc < width - 1; i++) {
+        if (str[i] === "\x1b") { inEsc = true; result += str[i]; }
+        else if (inEsc) { result += str[i]; if (str[i] === "m") inEsc = false; }
+        else { result += str[i]; vc++; }
+      }
+      return result + "…" + C.rst;
+    };
+
+    // ── Panel widths ──
+    const LW = Math.max(24, Math.floor(W * 0.62));
+    const RW = W - LW - 1; // 1 char for │ divider
+
+    // ════════════════════════════════════
+    // BUILD LEFT PANEL (header + accounts)
+    // ════════════════════════════════════
+    const L = [];
+    const timeStr = (now.split(" ").pop() || now).slice(0, 8);
+
+    L.push(`${C.bold}${C.cyan}⚡RootsFi${C.rst} ${C.dim}${timeStr}${C.rst}`);
+    L.push(`${C.dim}${rows.length} Akun ${modeLabel}${C.rst}`);
+    L.push(
+      `${C.green}✓${this.state.swapsOk}${C.rst} ` +
+      `${C.red}✗${this.state.swapsFail}${C.rst} ` +
+      `${C.dim}Σ${C.rst}${this.state.swapsTotal} ` +
+      `${C.dim}tgt${C.rst}${this.state.targetPerDay}${C.dim}/d${C.rst}`
     );
-    lines.push(
-      bannerLine(
-        `Sends: ${this.state.swapsTotal} total  ${this.state.swapsOk} ok  ${this.state.swapsFail} fail  |  Target: ${this.state.targetPerDay}/day`
-      )
+
+    const rwk = getTotalRewardsThisWeek();
+    const rdf = getTotalRewardsDiff();
+    L.push(
+      `${C.dim}Rwd ${C.rst}${rwk.cc.toFixed(1)} ` +
+      `${rdf.cc >= 0 ? C.green + "+" : C.red}${rdf.cc.toFixed(1)}${C.rst}` +
+      `${C.dim}CC $${rwk.usd.toFixed(0)}${C.rst}`
     );
-    const rewardsTotals = getTotalRewardsThisWeek();
-    lines.push(
-      bannerLine(
-        `Rewards this week (all accounts): ${rewardsTotals.cc.toFixed(2)} CC  |  $${rewardsTotals.usd.toFixed(2)}`
-      )
-    );
-    const rewardsDiffTotals = getTotalRewardsDiff();
-    lines.push(
-      bannerLine(
-        `Session earnings (all accounts): ${rewardsDiffTotals.cc >= 0 ? "+" : ""}${rewardsDiffTotals.cc.toFixed(2)} CC  |  ${rewardsDiffTotals.usd >= 0 ? "+" : ""}$${rewardsDiffTotals.usd.toFixed(2)}`
-      )
-    );
-    if (String(this.state.mode || "").toLowerCase() === "balance-only") {
-      const initialCcTotal = getTotalInitialCcBalance();
-      lines.push(
-        bannerLine(
-          `Initial balance (all accounts, at login): ${initialCcTotal.toFixed(4)} CC`
-        )
-      );
-    }
+
     const uptimeLabel = getGlobalUptimeLabel();
-    lines.push(
-      bannerLine(
-        uptimeLabel
-          ? `State: ${this.state.phase}  |  Uptime: ${uptimeLabel}`
-          : `State: ${this.state.phase}`
-      )
+    const phColor = {
+      send: C.green, cooldown: C.yellow, init: C.dim,
+      "browser-checkpoint": C.magenta, "session-reuse": C.cyan
+    }[String(this.state.phase || "").toLowerCase()] || C.white;
+    L.push(
+      `${phColor}▸${String(this.state.phase || "-").toUpperCase().slice(0, 7)}${C.rst}` +
+      (uptimeLabel ? ` ${C.dim}${uptimeLabel}${C.rst}` : "")
     );
-    lines.push(midBorder);
-    lines.push(tableRow(["Akun", "Status", "CC", "TX Progress", "Send Plan", "Score / Tier", "Rewards/Week", "Diff Reward"]));
-    lines.push(tableRule("-"));
+
+    if (String(this.state.mode || "").toLowerCase() === "balance-only") {
+      const initCc = getTotalInitialCcBalance();
+      L.push(`${C.dim}Init ${C.rst}${initCc.toFixed(2)}`);
+    }
+
+    L.push(`${C.dim}${"─".repeat(LW)}${C.rst}`);
+
+    // Account rows — 1 line each: marker+name status cc tier Δdiff
+    const nameW = Math.min(8, Math.floor(LW * 0.28));
+    const stW = 4;
+
+    // Format CC to max 2 decimal places, compact
+    const fmtCc = (raw) => {
+      const n = Number(raw);
+      if (!Number.isFinite(n)) return String(raw || "-");
+      if (n >= 1000) return n.toFixed(0);
+      if (n >= 100) return n.toFixed(1);
+      return n.toFixed(2);
+    };
+
+    // Tier abbreviation: UNR, NEW, ADV, PRO, ELI
+    const tierAbbr = (name) => {
+      const t = String(tierDisplayNameByAccount.get(name) || "?").toLowerCase();
+      if (t.startsWith("elite")) return "ELI";
+      if (t.startsWith("pro")) return "PRO";
+      if (t.startsWith("adv")) return "ADV";
+      if (t.startsWith("new")) return "NEW";
+      if (t.startsWith("unr")) return "UNR";
+      return " ? ";
+    };
+
+    // Compact reward diff: "+1.2" or "-0.3" or "-"
+    const fmtDiff = (accountName) => {
+      const diff = getAccountRewardsDiff(accountName);
+      if (!isObject(diff) || !Number.isFinite(diff.cc)) return "  -";
+      const v = diff.cc;
+      const s = `${v >= 0 ? "+" : ""}${v.toFixed(1)}`;
+      return s.padStart(5);
+    };
+
+    // Score number + band label from reward string like "85/100 Strong"
+    const parseScore = (reward) => {
+      const r = String(reward || "-").trim();
+      if (r === "-") return { num: " -", band: " - " };
+      const numMatch = r.match(/(\d+)/);
+      const num = numMatch ? numMatch[1].padStart(2) : " -";
+      // Band: extract word after "N/100 " — e.g. Strong, High, Stable, Low
+      const bandMatch = r.match(/\d+\/\d+\s+(\w+)/);
+      let band = " - ";
+      if (bandMatch) {
+        const b = bandMatch[1].toLowerCase();
+        if (b.startsWith("str")) band = "Str";
+        else if (b.startsWith("hi")) band = "Hi ";
+        else if (b.startsWith("sta")) band = "Stb";
+        else if (b.startsWith("lo")) band = "Lo ";
+        else if (b.startsWith("ver")) band = "VLo";
+        else band = bandMatch[1].slice(0, 3);
+      } else if (r.startsWith("LOW")) {
+        band = "Lo ";
+      } else if (r.startsWith("SKIP")) {
+        band = "Skp";
+      }
+      return { num, band };
+    };
 
     if (rows.length === 0) {
-      lines.push(tableRow(["-", "IDLE", "-", "-", "-", "-", "-", "-"]));
+      L.push(`${C.dim}(no accts)${C.rst}`);
     } else {
+      // Column header
+      L.push(
+        `${C.dim} ${"Akun".padEnd(nameW)} ` +
+        `${"Sts".padEnd(stW)} ` +
+        `${"CC".padEnd(7)}` +
+        `${"Tx".padEnd(4)}` +
+        `${"Sc".padStart(2)} ` +
+        `${"Qly"} ` +
+        `${"Tier"} ` +
+        `${"Rwd".padEnd(5)}` +
+        `${"Δ".padStart(5)}${C.rst}`
+      );
+
+      const stMap = {
+        IDLE: "IDLE", SEND: "SEND", COOLDOWN: "COOL",
+        SECURITY: "SECU", SESSION: "SESS", "OTP-WAIT": "OTP!",
+        "OTP-VERIFY": "OTPV", SYNC: "SYNC", "DRY-RUN": "DRY ",
+        FINALIZE: "DONE", QUEUE: "QUE "
+      };
+      const stColorMap = {
+        IDLE: C.dim, SEND: C.green, COOL: C.yellow,
+        SECU: C.magenta, SESS: C.cyan, "OTP!": C.red,
+        OTPV: C.red, SYNC: C.blue, "QUE ": C.dim,
+        "DRY ": C.yellow, DONE: C.green
+      };
+
+      // Compact reward this week: extract CC number only
+      const fmtRwd = (rwStr) => {
+        const s = String(rwStr || "-").trim();
+        if (s === "-") return "-".padEnd(5);
+        const m = s.match(/([\d.]+)/);
+        return m ? m[1].slice(0, 5).padEnd(5) : s.slice(0, 5).padEnd(5);
+      };
+
       for (const row of rows) {
-        const progressLabel = String(row.progress || "-");
-        const sendLabel = String(row.send || "-");
-        const rewardLabel = String(row.reward || "-");
-        const tierDisplayName = tierDisplayNameByAccount.get(row.name) || "?";
-        const scoreTierLabel = rewardLabel === "-" ? `- / ${tierDisplayName}` : `${rewardLabel} / ${tierDisplayName}`;
-        const rewardsWeekLabel = String(row.rewardsThisWeek || "-");
-        const rewardsDiffLabel = String(row.rewardsDiff || "-");
-        lines.push(tableRow([row.name, row.status, row.cc, progressLabel, sendLabel, scoreTierLabel, rewardsWeekLabel, rewardsDiffLabel]));
+        const st = stMap[row.status] || row.status.slice(0, stW);
+        const stColor = stColorMap[st] || C.white;
+        const ccVal = fmtCc(row.cc);
+        const marker = row.active ? `${C.bold}›` : " ";
+        const tier = tierAbbr(row.name);
+        const { num: scoreNum, band: scoreBand } = parseScore(row.reward);
+        const bandColor = scoreBand === "Hi " ? C.green
+          : (scoreBand === "Str" ? C.green
+          : (scoreBand === "Lo " || scoreBand === "VLo" || scoreBand === "Skp" ? C.red
+          : C.yellow));
+        const df = fmtDiff(row.name);
+        const dfColor = df.includes("+") ? C.green : (df.includes("-") && !df.includes("  -") ? C.red : C.dim);
+        const rwd = fmtRwd(row.rewardsThisWeek);
+
+        const txStats = getPerAccountTxStats(row.name);
+        const txLbl = `${txStats.ok}/${txStats.fail}`.padEnd(4);
+
+        L.push(
+          `${marker}${this.clip(row.name, nameW).padEnd(nameW)} ${C.rst}` +
+          `${stColor}${st}${C.rst} ` +
+          `${C.cyan}${ccVal.padEnd(7)}${C.rst}` +
+          `${C.dim}${txLbl}${C.rst}` +
+          `${C.white}${scoreNum}${C.rst} ` +
+          `${bandColor}${scoreBand}${C.rst} ` +
+          `${C.dim}${tier}${C.rst} ` +
+          `${C.yellow}${rwd}${C.rst}` +
+          `${dfColor}${df}${C.rst}`
+        );
       }
     }
 
-    lines.push(midBorder);
-    lines.push("");
-    lines.push(`--- Execution Logs (last ${this.logLines}) ---`);
-
-    if (this.logs.length === 0) {
-      lines.push("[--:--:--] INFO  (no logs yet)");
-    } else {
-      const logMessageWidth = Math.max(48, frameWidth - 24);
-      for (const log of this.logs) {
-        lines.push(`[${log.time}] ${log.level.padEnd(5)} ${this.clip(log.message, logMessageWidth)}`);
-      }
-    }
-
-    lines.push("");
-    const profitLabel = lastProfitabilityStatus
-      ? `${lastProfitabilityStatus.modeLabel} ${lastProfitabilityStatus.currentRecoveryPercent}%`
+    L.push(`${C.dim}${"─".repeat(LW)}${C.rst}`);
+    const profitMode = lastProfitabilityStatus
+      ? String(lastProfitabilityStatus.modeLabel || lastProfitabilityStatus.mode || "-")
       : "-";
-    lines.push(`Ctrl+C to stop  |  delay ${this.state.minDelay || "?"}s-${this.state.maxDelay || "?"}s  |  cap ${HOURLY_MAX_TX_PER_ACCOUNT}/hr  |  profitability: ${profitLabel}`);
+    const profitColor = {
+      green: C.green, amber: C.yellow, red: C.red
+    }[profitMode.toLowerCase()] || C.dim;
+    L.push(
+      `${C.dim}${this.state.minDelay || "?"}s-${this.state.maxDelay || "?"}s ` +
+      `${HOURLY_MAX_TX_PER_ACCOUNT}/h ${C.rst}` +
+      `${profitColor}P:${profitMode}${C.rst}`
+    );
 
-    process.stdout.write(`\x1b[2J\x1b[H${lines.join("\n")}\n`);
+    // ════════════════════════════════
+    // BUILD RIGHT PANEL (logs)
+    // ════════════════════════════════
+    const R = [];
+    R.push(`${C.dim}── Log (${this.logLines}) ──${C.rst}`);
+    R.push(`${C.dim}${"─".repeat(RW)}${C.rst}`);
+
+    const logMsgW = Math.max(8, RW - 6);
+    if (this.logs.length === 0) {
+      R.push(`${C.dim}(empty)${C.rst}`);
+    } else {
+      // Only show last this.logLines entries (respects config.ui.logLines)
+      const visibleLogs = this.logs.slice(-this.logLines);
+      for (const log of visibleLogs) {
+        const lc = log.level === "ERROR" ? C.red
+          : (log.level === "WARN" ? C.yellow : C.dim);
+        const ts = log.time.slice(0, 5);
+        const msg = String(log.message || "");
+        // Wrap long messages to multiple lines instead of truncating
+        if (msg.length <= logMsgW) {
+          R.push(`${C.dim}${ts}${C.rst}${lc}${msg}${C.rst}`);
+        } else {
+          // First line with timestamp
+          R.push(`${C.dim}${ts}${C.rst}${lc}${msg.slice(0, logMsgW)}${C.rst}`);
+          // Continuation lines (indented, no timestamp)
+          let pos = logMsgW;
+          const contW = RW - 1; // full width minus 1 indent space
+          while (pos < msg.length) {
+            R.push(`${lc} ${msg.slice(pos, pos + contW)}${C.rst}`);
+            pos += contW;
+          }
+        }
+      }
+    }
+
+    // ════════════════════════════════
+    // MERGE LEFT + RIGHT into output
+    // ════════════════════════════════
+    const maxH = Math.max(L.length, R.length);
+    while (L.length < maxH) L.push("");
+    while (R.length < maxH) R.push("");
+
+    const output = [];
+    output.push(C.dim + "━".repeat(W) + C.rst);
+    for (let i = 0; i < maxH; i++) {
+      output.push(
+        `${fitCell(L[i], LW)}${C.dim}│${C.rst}${fitCell(R[i], RW)}`
+      );
+    }
+    output.push(C.dim + "━".repeat(W) + C.rst);
+
+    process.stdout.write(`\x1b[2J\x1b[H${output.join("\n")}\n`);
   }
 }
 
@@ -2100,7 +2280,7 @@ async function promptAccountSelection(accounts) {
   try {
     console.log("\n=== Pilih Akun untuk TX ===");
     console.log("0. Semua akun");
-    
+
     for (let i = 0; i < accounts.length; i++) {
       console.log(`${i + 1}. ${accounts[i].name} (${maskEmail(accounts[i].email)})`);
     }
@@ -2117,7 +2297,7 @@ async function promptAccountSelection(accounts) {
     if (choice.includes(",")) {
       const indices = choice.split(",").map(s => parseInt(s.trim(), 10));
       const selectedAccounts = [];
-      
+
       for (const idx of indices) {
         if (idx >= 1 && idx <= accounts.length) {
           selectedAccounts.push(accounts[idx - 1]);
@@ -2262,26 +2442,26 @@ function buildSendRequestsWithRandomRecipients(recipients, sendPolicy) {
 // Build internal recipients from accounts.json (exclude self)
 function buildInternalRecipients(accounts, currentAccountName) {
   const recipients = [];
-  
+
   for (const account of accounts) {
     // Skip self
     if (account.name === currentAccountName) {
       continue;
     }
-    
+
     // Skip accounts without address
     const address = String(account.address || "").trim();
     if (!address) {
       continue;
     }
-    
+
     recipients.push({
       alias: account.name,
       address: address,
       partyId: address // For internal, address IS the full cantonPartyId
     });
   }
-  
+
   return recipients;
 }
 
@@ -2348,7 +2528,7 @@ function resolveSendRecipientTarget(input, recipients) {
 
   const resolvedPartyId = String(
     found.partyId ||
-      (String(found.address || "").includes("::") ? found.address : `${found.alias}::${found.address}`)
+    (String(found.address || "").includes("::") ? found.address : `${found.alias}::${found.address}`)
   ).trim();
 
   return {
@@ -2517,6 +2697,23 @@ function isBalanceContractFragmentationError(error) {
     message.includes("split across too many contracts") ||
     (message.includes("too many contracts") && message.includes("would be needed")) ||
     (message.includes("contracts") && message.includes("one transaction"))
+  );
+}
+
+/**
+ * Detect HTTP 400 error with hourly send limit message from server.
+ * Matches messages like "hourly send limit", "send limit exceeded", etc.
+ */
+function isHourlySendLimitError(error) {
+  const status = Number(error && error.status);
+  if (status !== 400) return false;
+  const message = String(error && error.message ? error.message : error || "").toLowerCase();
+  return (
+    (message.includes("hourly") && message.includes("limit")) ||
+    (message.includes("send") && message.includes("limit")) ||
+    (message.includes("hourly") && message.includes("send")) ||
+    message.includes("rate limit") ||
+    message.includes("too many send")
   );
 }
 
@@ -2726,10 +2923,10 @@ function normalizeConfig(rawConfig) {
     Object.prototype.hasOwnProperty.call(sendInput, "maxLoopTx")
       ? sendInput.maxLoopTx
       : (
-          Object.prototype.hasOwnProperty.call(sendInput, "maxTx")
-            ? sendInput.maxTx
-            : sendInput.maxTxPerAccount
-        ),
+        Object.prototype.hasOwnProperty.call(sendInput, "maxTx")
+          ? sendInput.maxTx
+          : sendInput.maxTxPerAccount
+      ),
     INTERNAL_API_DEFAULTS.send.maxLoopTx
   );
   if (maxLoopTx < 1) {
@@ -2741,45 +2938,45 @@ function normalizeConfig(rawConfig) {
     : sendInput.delayBetweenTx;
   const legacyDelayBetweenTxMin = isObject(legacyDelayBetweenTx)
     ? (
-        Object.prototype.hasOwnProperty.call(legacyDelayBetweenTx, "min")
-          ? legacyDelayBetweenTx.min
-          : legacyDelayBetweenTx.max
-      )
+      Object.prototype.hasOwnProperty.call(legacyDelayBetweenTx, "min")
+        ? legacyDelayBetweenTx.min
+        : legacyDelayBetweenTx.max
+    )
     : legacyDelayBetweenTx;
   const legacyDelayBetweenTxMax = isObject(legacyDelayBetweenTx)
     ? (
-        Object.prototype.hasOwnProperty.call(legacyDelayBetweenTx, "max")
-          ? legacyDelayBetweenTx.max
-          : legacyDelayBetweenTx.min
-      )
+      Object.prototype.hasOwnProperty.call(legacyDelayBetweenTx, "max")
+        ? legacyDelayBetweenTx.max
+        : legacyDelayBetweenTx.min
+    )
     : legacyDelayBetweenTx;
 
   const minDelayTxSeconds = clampToNonNegativeInt(
     Object.prototype.hasOwnProperty.call(sendInput, "minDelayTxSeconds")
       ? sendInput.minDelayTxSeconds
       : (
-          Object.prototype.hasOwnProperty.call(sendInput, "mindelayTxSeconds")
-            ? sendInput.mindelayTxSeconds
-            : (
-                Object.prototype.hasOwnProperty.call(sendInput, "delayTxSeconds")
-                  ? sendInput.delayTxSeconds
-                  : legacyDelayBetweenTxMin
-              )
-        ),
+        Object.prototype.hasOwnProperty.call(sendInput, "mindelayTxSeconds")
+          ? sendInput.mindelayTxSeconds
+          : (
+            Object.prototype.hasOwnProperty.call(sendInput, "delayTxSeconds")
+              ? sendInput.delayTxSeconds
+              : legacyDelayBetweenTxMin
+          )
+      ),
     INTERNAL_API_DEFAULTS.send.minDelayTxSeconds
   );
   const maxDelayTxSeconds = clampToNonNegativeInt(
     Object.prototype.hasOwnProperty.call(sendInput, "maxDelayTxSeconds")
       ? sendInput.maxDelayTxSeconds
       : (
-          Object.prototype.hasOwnProperty.call(sendInput, "maxdelayTxSeconds")
-            ? sendInput.maxdelayTxSeconds
-            : (
-                Object.prototype.hasOwnProperty.call(sendInput, "delayTxSeconds")
-                  ? sendInput.delayTxSeconds
-                  : legacyDelayBetweenTxMax
-              )
-        ),
+        Object.prototype.hasOwnProperty.call(sendInput, "maxdelayTxSeconds")
+          ? sendInput.maxdelayTxSeconds
+          : (
+            Object.prototype.hasOwnProperty.call(sendInput, "delayTxSeconds")
+              ? sendInput.delayTxSeconds
+              : legacyDelayBetweenTxMax
+          )
+      ),
     INTERNAL_API_DEFAULTS.send.maxDelayTxSeconds
   );
 
@@ -2791,14 +2988,14 @@ function normalizeConfig(rawConfig) {
     Object.prototype.hasOwnProperty.call(sendInput, "delayCycleSeconds")
       ? sendInput.delayCycleSeconds
       : (
-          Object.prototype.hasOwnProperty.call(sendInput, "delayBetweenCycles")
-            ? sendInput.delayBetweenCycles
-            : (
-                Object.prototype.hasOwnProperty.call(sendInput, "delayBetweenCycle")
-                  ? sendInput.delayBetweenCycle
-                  : sendInput.loopDelaySeconds
-              )
-        ),
+        Object.prototype.hasOwnProperty.call(sendInput, "delayBetweenCycles")
+          ? sendInput.delayBetweenCycles
+          : (
+            Object.prototype.hasOwnProperty.call(sendInput, "delayBetweenCycle")
+              ? sendInput.delayBetweenCycle
+              : sendInput.loopDelaySeconds
+          )
+      ),
     INTERNAL_API_DEFAULTS.send.delayCycleSeconds
   );
 
@@ -2811,10 +3008,10 @@ function normalizeConfig(rawConfig) {
     typeof sendInput.sequentialAllRounds === "boolean"
       ? sendInput.sequentialAllRounds
       : (
-          typeof sendInput.parallelEnabled === "boolean"
-            ? !sendInput.parallelEnabled
-            : INTERNAL_API_DEFAULTS.send.sequentialAllRounds
-        );
+        typeof sendInput.parallelEnabled === "boolean"
+          ? !sendInput.parallelEnabled
+          : INTERNAL_API_DEFAULTS.send.sequentialAllRounds
+      );
 
   const workers = Math.max(1, clampToNonNegativeInt(
     sendInput.workers,
@@ -2825,12 +3022,15 @@ function normalizeConfig(rawConfig) {
     Object.prototype.hasOwnProperty.call(sendInput, "hourlyMaxTx")
       ? sendInput.hourlyMaxTx
       : (
-          Object.prototype.hasOwnProperty.call(sendInput, "HourlyMax")
-            ? sendInput.HourlyMax
-            : sendInput.hourlyMax
-        ),
+        Object.prototype.hasOwnProperty.call(sendInput, "HourlyMax")
+          ? sendInput.HourlyMax
+          : sendInput.hourlyMax
+      ),
     10
   ) || 10;
+
+  const autoDelay400 = sendInput.autoDelay400 === true;
+  const autoDelayHour = Math.max(0.1, Number(sendInput.autoDelayHour) || 1);
 
   const send = {
     maxLoopTx,
@@ -2840,7 +3040,9 @@ function normalizeConfig(rawConfig) {
     sequentialAllRounds,
     workers,
     tierAmounts,
-    hourlyMaxTx
+    hourlyMaxTx,
+    autoDelay400,
+    autoDelayHour
   };
 
   const safetyInput = isObject(rawConfig.safety) ? rawConfig.safety : {};
@@ -2867,9 +3069,7 @@ function normalizeConfig(rawConfig) {
 
   const captchaInput = isObject(rawConfig.captcha) ? rawConfig.captcha : {};
   const captchaProvider = String(captchaInput.provider || "self-hosted").toLowerCase().trim();
-  const validProviders = ["self-hosted", "2captcha", "multibot", "auto"];
-  const fallbackProviderInput = String(captchaInput.fallbackProvider || "2captcha").toLowerCase().trim();
-  const validFallbackProviders = ["2captcha", "multibot"];
+  const validProviders = ["self-hosted", "2captcha", "auto"];
 
   // solverUrl supports single string or array of strings for load balancing
   let solverUrls;
@@ -2887,7 +3087,6 @@ function normalizeConfig(rawConfig) {
 
   const captcha = {
     provider: validProviders.includes(captchaProvider) ? captchaProvider : "self-hosted",
-    fallbackProvider: validFallbackProviders.includes(fallbackProviderInput) ? fallbackProviderInput : "2captcha",
     solverUrl: solverUrls.length === 1 ? solverUrls[0] : solverUrls[0],
     solverUrls: solverUrls,
     apiKey: String(captchaInput.apiKey || "").trim()
@@ -2898,8 +3097,8 @@ function normalizeConfig(rawConfig) {
   const allowedChatIdsRaw = Array.isArray(tgInput.allowedChatIds)
     ? tgInput.allowedChatIds
     : (typeof tgInput.allowedChatIds === "string"
-        ? tgInput.allowedChatIds.split(",")
-        : []);
+      ? tgInput.allowedChatIds.split(",")
+      : []);
   const telegram = {
     enabled: tgInput.enabled === false ? false : true,
     botToken: String(tgInput.botToken || tgInput.bot_token || "").trim(),
@@ -3079,7 +3278,7 @@ async function acquireBrowserChallengeSlot() {
   const queuedAt = Date.now();
   console.log(
     `[browser-queue] Challenge queued (position ${queuePosition}), ` +
-      `active=${activeBrowserChallenges}/${BROWSER_CHALLENGE_MAX_CONCURRENT}`
+    `active=${activeBrowserChallenges}/${BROWSER_CHALLENGE_MAX_CONCURRENT}`
   );
 
   await new Promise((resolve) => {
@@ -3089,7 +3288,7 @@ async function acquireBrowserChallengeSlot() {
   const waitedSeconds = Math.max(1, Math.round((Date.now() - queuedAt) / 1000));
   console.log(
     `[browser-queue] Slot acquired after waiting ${waitedSeconds}s ` +
-      `(${activeBrowserChallenges}/${BROWSER_CHALLENGE_MAX_CONCURRENT})`
+    `(${activeBrowserChallenges}/${BROWSER_CHALLENGE_MAX_CONCURRENT})`
   );
 }
 
@@ -3113,7 +3312,7 @@ async function acquireSessionReuseSlot(accountLogTag = null) {
   const queuedAt = Date.now();
   console.log(
     `${prefix}[session-queue] Session reuse queued (position ${queuePosition}), ` +
-      `active=${activeSessionReuseChallenges}/${SESSION_REUSE_MAX_CONCURRENT}`
+    `active=${activeSessionReuseChallenges}/${SESSION_REUSE_MAX_CONCURRENT}`
   );
 
   await new Promise((resolve) => {
@@ -3123,7 +3322,7 @@ async function acquireSessionReuseSlot(accountLogTag = null) {
   const waitedSeconds = Math.max(1, Math.round((Date.now() - queuedAt) / 1000));
   console.log(
     `${prefix}[session-queue] Slot acquired after waiting ${waitedSeconds}s ` +
-      `(${activeSessionReuseChallenges}/${SESSION_REUSE_MAX_CONCURRENT})`
+    `(${activeSessionReuseChallenges}/${SESSION_REUSE_MAX_CONCURRENT})`
   );
 }
 
@@ -3142,7 +3341,7 @@ function releaseSessionReuseSlot(accountLogTag = null) {
 
   console.log(
     `${prefix}[session-queue] Slot released ` +
-      `(active=${activeSessionReuseChallenges}/${SESSION_REUSE_MAX_CONCURRENT}, queue=${sessionReuseWaitQueue.length})`
+    `(active=${activeSessionReuseChallenges}/${SESSION_REUSE_MAX_CONCURRENT}, queue=${sessionReuseWaitQueue.length})`
   );
 }
 
@@ -3159,7 +3358,7 @@ function releaseBrowserChallengeSlot() {
 
   console.log(
     `[browser-queue] Slot released ` +
-      `(active=${activeBrowserChallenges}/${BROWSER_CHALLENGE_MAX_CONCURRENT}, queue=${browserChallengeWaitQueue.length})`
+    `(active=${activeBrowserChallenges}/${BROWSER_CHALLENGE_MAX_CONCURRENT}, queue=${browserChallengeWaitQueue.length})`
   );
 }
 
@@ -3357,7 +3556,7 @@ async function solveBrowserChallenge(baseUrl, onboardPath, userAgent, headless =
     if (cookies.length === 0 && status === 429) {
       console.log(
         `[browser] Still no cookies after challenge on HTTP 429. ` +
-          `Cooling down ${Math.round(BROWSER_CHALLENGE_RETRY_DELAY_MS / 1000)}s then running quick retry...`
+        `Cooling down ${Math.round(BROWSER_CHALLENGE_RETRY_DELAY_MS / 1000)}s then running quick retry...`
       );
       await sleep(BROWSER_CHALLENGE_RETRY_DELAY_MS);
 
@@ -3407,7 +3606,7 @@ async function solveBrowserChallenge(baseUrl, onboardPath, userAgent, headless =
         // Force kill Chromium if close() failed to prevent zombie
         if (trackedPid) {
           try { process.kill(trackedPid, "SIGKILL"); console.log(`[browser] Force-killed Chromium pid ${trackedPid}`); }
-          catch {}
+          catch { }
         }
       }
       untrackBrowserPid(trackedPid);
@@ -3442,15 +3641,12 @@ function isTrafficCongestionError(error) {
 // Supported providers (config.captcha.provider):
 //   "self-hosted" — Turnstile-Solver lokal (GRATIS, default)
 //   "2captcha"    — 2Captcha API (berbayar, butuh apiKey)
-//   "multibot"    — Multibot API (berbayar, butuh apiKey)
-//   "auto"        — coba self-hosted dulu, fallback ke remote provider jika gagal
+//   "auto"        — coba self-hosted dulu, fallback ke 2captcha jika gagal
 // ============================================================================
 const TURNSTILE_SITEKEY = "0x4AAAAAAC-oOGMu5lxFvc7w";
 const TURNSTILE_PAGEURL = "https://bridge.rootsfi.com/send";
 const TWOCAPTCHA_IN_URL = "https://2captcha.com/in.php";
 const TWOCAPTCHA_RES_URL = "https://2captcha.com/res.php";
-const MULTIBOT_IN_URL = "https://api.multibot.cloud/in.php";
-const MULTIBOT_RES_URL = "https://api.multibot.cloud/res.php";
 const TWOCAPTCHA_POLL_INTERVAL_MS = 5000;
 const TWOCAPTCHA_POLL_TIMEOUT_MS = 180000;
 const TWOCAPTCHA_INITIAL_WAIT_MS = 10000;
@@ -3473,67 +3669,8 @@ function isTrafficChallengeRequiredError(error) {
 }
 
 async function solveTurnstileVia2Captcha(apiKey, { sitekey = TURNSTILE_SITEKEY, pageurl = TURNSTILE_PAGEURL } = {}) {
-  return solveTurnstileViaRemoteCaptcha("2captcha", apiKey, { sitekey, pageurl });
-}
-
-async function solveTurnstileViaMultibot(apiKey, { sitekey = TURNSTILE_SITEKEY, pageurl = TURNSTILE_PAGEURL } = {}) {
-  return solveTurnstileViaRemoteCaptcha("multibot", apiKey, { sitekey, pageurl });
-}
-
-function resolveRemoteCaptchaProvider(providerName) {
-  const normalized = String(providerName || "").toLowerCase().trim();
-  if (normalized === "2captcha") {
-    return {
-      name: "2captcha",
-      label: "2Captcha",
-      inUrl: TWOCAPTCHA_IN_URL,
-      resUrl: TWOCAPTCHA_RES_URL
-    };
-  }
-  if (normalized === "multibot") {
-    return {
-      name: "multibot",
-      label: "Multibot",
-      inUrl: MULTIBOT_IN_URL,
-      resUrl: MULTIBOT_RES_URL
-    };
-  }
-  throw new Error(`Unknown remote captcha provider: ${providerName}`);
-}
-
-function parseRemoteCaptchaResponse(responseText) {
-  const text = String(responseText || "").trim();
-  if (!text) {
-    return { status: "error", value: "empty response" };
-  }
-
-  try {
-    const parsed = JSON.parse(text);
-    if (parsed && typeof parsed === "object" && Object.prototype.hasOwnProperty.call(parsed, "status")) {
-      if (Number(parsed.status) === 1) {
-        return { status: "ok", value: String(parsed.request || "").trim() };
-      }
-      const request = String(parsed.request || "").trim();
-      if (request === "CAPCHA_NOT_READY") {
-        return { status: "pending", value: request };
-      }
-      return { status: "error", value: request || text.slice(0, 200) };
-    }
-  } catch {}
-
-  if (text === "CAPCHA_NOT_READY") {
-    return { status: "pending", value: text };
-  }
-  if (text.startsWith("OK|")) {
-    return { status: "ok", value: text.slice(3).trim() };
-  }
-  return { status: "error", value: text.slice(0, 200) };
-}
-
-async function solveTurnstileViaRemoteCaptcha(providerName, apiKey, { sitekey = TURNSTILE_SITEKEY, pageurl = TURNSTILE_PAGEURL } = {}) {
-  const provider = resolveRemoteCaptchaProvider(providerName);
   if (!apiKey) {
-    throw new Error(`${provider.label} API key missing (config.captcha.apiKey)`);
+    throw new Error("2Captcha API key missing (config.captcha.apiKey)");
   }
 
   const fetchFn = (typeof globalThis.fetch === "function") ? globalThis.fetch.bind(globalThis) : null;
@@ -3541,46 +3678,59 @@ async function solveTurnstileViaRemoteCaptcha(providerName, apiKey, { sitekey = 
     throw new Error("global fetch is not available in this Node runtime");
   }
 
-  const submitUrl = `${provider.inUrl}?key=${encodeURIComponent(apiKey)}`
+  const submitUrl = `${TWOCAPTCHA_IN_URL}?key=${encodeURIComponent(apiKey)}`
     + `&method=turnstile&sitekey=${encodeURIComponent(sitekey)}`
-    + `&pageurl=${encodeURIComponent(pageurl)}`;
+    + `&pageurl=${encodeURIComponent(pageurl)}&json=1`;
+
   const submitResp = await fetchFn(submitUrl, { method: "GET" });
   const submitText = await submitResp.text();
-  const submitResult = parseRemoteCaptchaResponse(submitText);
-  if (submitResult.status !== "ok" || !submitResult.value) {
-    throw new Error(`${provider.label} in.php error: ${submitResult.value || submitText.slice(0, 200)}`);
+  let submitJson;
+  try {
+    submitJson = JSON.parse(submitText);
+  } catch {
+    throw new Error(`2Captcha in.php returned non-JSON: ${submitText.slice(0, 200)}`);
+  }
+  if (!submitJson || submitJson.status !== 1) {
+    throw new Error(`2Captcha in.php error: ${submitJson && submitJson.request ? submitJson.request : submitText.slice(0, 200)}`);
   }
 
-  const captchaId = submitResult.value;
-  console.log(`[captcha] ${provider.label} task submitted (id=${captchaId}). Waiting for solve...`);
+  const captchaId = String(submitJson.request);
+  console.log(`[captcha] 2Captcha task submitted (id=${captchaId}). Waiting for solve...`);
   await sleep(TWOCAPTCHA_INITIAL_WAIT_MS);
 
   const deadline = Date.now() + TWOCAPTCHA_POLL_TIMEOUT_MS;
   while (Date.now() < deadline) {
-    const pollUrl = `${provider.resUrl}?key=${encodeURIComponent(apiKey)}`
-      + `&action=get&id=${encodeURIComponent(captchaId)}`;
+    const pollUrl = `${TWOCAPTCHA_RES_URL}?key=${encodeURIComponent(apiKey)}`
+      + `&action=get&id=${encodeURIComponent(captchaId)}&json=1`;
     const pollResp = await fetchFn(pollUrl, { method: "GET" });
     const pollText = await pollResp.text();
-    const pollResult = parseRemoteCaptchaResponse(pollText);
-
-    if (pollResult.status === "ok") {
-      const token = String(pollResult.value || "").trim();
-      if (!token) {
-        throw new Error(`${provider.label} returned empty token`);
-      }
-      console.log(`[captcha] Turnstile token received via ${provider.label} (len=${token.length}).`);
-      return token;
-    }
-
-    if (pollResult.status === "pending") {
+    let pollJson;
+    try {
+      pollJson = JSON.parse(pollText);
+    } catch {
+      console.log(`[captcha] poll parse error: ${pollText.slice(0, 160)}. Retrying...`);
       await sleep(TWOCAPTCHA_POLL_INTERVAL_MS);
       continue;
     }
 
-    throw new Error(`${provider.label} res.php error: ${pollResult.value || pollText.slice(0, 200)}`);
+    if (pollJson.status === 1) {
+      const token = String(pollJson.request || "").trim();
+      if (!token) {
+        throw new Error("2Captcha returned empty token");
+      }
+      console.log(`[captcha] Turnstile token received (len=${token.length}).`);
+      return token;
+    }
+
+    if (pollJson.request === "CAPCHA_NOT_READY") {
+      await sleep(TWOCAPTCHA_POLL_INTERVAL_MS);
+      continue;
+    }
+
+    throw new Error(`2Captcha res.php error: ${pollJson.request || pollText.slice(0, 200)}`);
   }
 
-  throw new Error(`${provider.label} timed out after ${TWOCAPTCHA_POLL_TIMEOUT_MS / 1000}s waiting for Turnstile token`);
+  throw new Error(`2Captcha timed out after ${TWOCAPTCHA_POLL_TIMEOUT_MS / 1000}s waiting for Turnstile token`);
 }
 
 /**
@@ -3686,7 +3836,7 @@ async function solveTurnstileViaSelfHosted(solverBaseUrl, { sitekey = TURNSTILE_
 /**
  * Smart captcha solver wrapper — auto-selects provider based on config.
  * Supports multiple solver URLs with round-robin load balancing.
- * Provider options: "self-hosted" (default, gratis), "2captcha", "multibot", "auto".
+ * Provider options: "self-hosted" (default, gratis), "2captcha" (berbayar), "auto" (coba self-hosted dulu).
  */
 async function solveTurnstile(captchaConfig) {
   const provider = String(captchaConfig && captchaConfig.provider || "self-hosted").toLowerCase().trim();
@@ -3694,17 +3844,13 @@ async function solveTurnstile(captchaConfig) {
     ? captchaConfig.solverUrls
     : [String(captchaConfig && captchaConfig.solverUrl || SELFHOSTED_SOLVER_DEFAULT_URL).trim()];
   const apiKey = String(captchaConfig && captchaConfig.apiKey || "").trim();
-  const fallbackProvider = String(captchaConfig && captchaConfig.fallbackProvider || "2captcha").toLowerCase().trim();
 
-  if (provider === "2captcha" || provider === "multibot") {
-    const remoteProvider = resolveRemoteCaptchaProvider(provider);
+  if (provider === "2captcha") {
     if (!apiKey) {
-      throw new Error(`Provider ${provider} dipilih tapi config.captcha.apiKey kosong!`);
+      throw new Error("Provider 2captcha dipilih tapi config.captcha.apiKey kosong!");
     }
-    console.log(`[captcha] Solving Turnstile via ${remoteProvider.label} (berbayar)...`);
-    return provider === "multibot"
-      ? solveTurnstileViaMultibot(apiKey)
-      : solveTurnstileVia2Captcha(apiKey);
+    console.log("[captcha] Solving Turnstile via 2Captcha (berbayar)...");
+    return solveTurnstileVia2Captcha(apiKey);
   }
 
   if (provider === "self-hosted") {
@@ -3729,7 +3875,7 @@ async function solveTurnstile(captchaConfig) {
   }
 
   if (provider === "auto") {
-    // Coba semua self-hosted dulu (round-robin), fallback ke remote provider
+    // Coba semua self-hosted dulu (round-robin), fallback ke 2captcha
     const errors = [];
     for (let i = 0; i < solverUrls.length; i++) {
       const idx = (_solverRoundRobinIndex + i) % solverUrls.length;
@@ -3744,20 +3890,17 @@ async function solveTurnstile(captchaConfig) {
         errors.push({ url, error: err });
       }
     }
-    // All self-hosted failed, try configured remote fallback
+    // All self-hosted failed, try 2captcha fallback
     if (apiKey) {
-      const remoteProvider = resolveRemoteCaptchaProvider(fallbackProvider);
-      console.log(`[captcha] [auto] Semua self-hosted gagal. Fallback ke ${remoteProvider.label}...`);
-      return fallbackProvider === "multibot"
-        ? solveTurnstileViaMultibot(apiKey)
-        : solveTurnstileVia2Captcha(apiKey);
+      console.log("[captcha] [auto] Semua self-hosted gagal. Fallback ke 2Captcha...");
+      return solveTurnstileVia2Captcha(apiKey);
     }
-    console.log("[captcha] [auto] Semua solver gagal, tidak ada fallback remote provider.");
+    console.log("[captcha] [auto] Semua solver gagal, tidak ada fallback 2Captcha.");
     const lastErr = errors.length > 0 ? errors[errors.length - 1].error : new Error("No solver URLs configured");
     throw lastErr;
   }
 
-  throw new Error(`Provider captcha tidak dikenal: "${provider}". Gunakan: "self-hosted", "2captcha", "multibot", atau "auto".`);
+  throw new Error(`Provider captcha tidak dikenal: "${provider}". Gunakan: "self-hosted", "2captcha", atau "auto".`);
 }
 
 let lastProfitabilityStatus = null;
@@ -4212,7 +4355,7 @@ class RootsFiApiClient {
         const response = await fetchFn(this.buildUrl(endpointPath), fetchOptions);
 
         clearTimeout(timeoutId);
-        
+
         // Reset consecutive timeout counter on success
         consecutiveTimeouts = 0;
 
@@ -4232,8 +4375,8 @@ class RootsFiApiClient {
                 const requestRef = vercelRequestId ? ` requestId=${vercelRequestId}` : "";
                 throw new Error(
                   `Blocked by Vercel Security Checkpoint at ${endpointPath} (HTTP ${response.status}).` +
-                    `${requestRef} Complete browser verification first, then place your session cookie in ` +
-                    "tokens.json (selected account token profile) and retry."
+                  `${requestRef} Complete browser verification first, then place your session cookie in ` +
+                  "tokens.json (selected account token profile) and retry."
                 );
               }
 
@@ -4270,9 +4413,9 @@ class RootsFiApiClient {
             // For non-critical endpoints, just throw timeout error immediately
             throw error;
           }
-          
+
           consecutiveTimeouts += 1;
-          
+
           // Check if we've hit max consecutive timeouts - trigger soft restart
           if (consecutiveTimeouts >= TIMEOUT_MAX_CONSECUTIVE) {
             console.log(
@@ -4284,7 +4427,7 @@ class RootsFiApiClient {
               consecutiveTimeouts
             );
           }
-          
+
           const backoffMs = calculateTimeoutBackoffMs(attempt);
           const backoffSec = Math.round(backoffMs / 1000);
           console.log(
@@ -4440,6 +4583,30 @@ class RootsFiApiClient {
     });
   }
 
+  async getWalletOffers() {
+    return this.requestJson("GET", this.paths.walletOffers, {
+      refererPath: this.paths.bridge
+    });
+  }
+
+  async acceptAllWalletOffers() {
+    // Bulk accept: POST /api/wallet/offers (no body) accepts all pending offers at once.
+    // Response: {"success":true,"data":{"offers":[],"accepted":N,"failed":N,"source":"fresh"}}
+    return this.requestJson("POST", this.paths.walletOffers, {
+      refererPath: this.paths.send,
+      timeoutMs: 30000
+    });
+  }
+
+  async acceptWalletOffer(offerPayload) {
+    // Individual accept: POST /api/wallet/offers/accept with full offer object as body.
+    return this.requestJson("POST", this.paths.walletOffersAccept, {
+      refererPath: this.paths.send,
+      timeoutMs: 30000,
+      body: offerPayload
+    });
+  }
+
   async getSendLimits() {
     return this.requestJson("GET", this.paths.sendLimits, {
       refererPath: this.paths.send
@@ -4534,7 +4701,7 @@ class RootsFiApiClient {
     const abortController = new AbortController();
     const timeoutMs = 10000; // 10 second timeout for rewards
     const timeoutId = setTimeout(() => abortController.abort(new Error("Rewards timeout")), timeoutMs);
-    
+
     try {
       const fetchOptions = {
         method: "GET",
@@ -4547,13 +4714,13 @@ class RootsFiApiClient {
       }
       const fetchFn = this._getFetchFn();
       const response = await fetchFn(this.buildUrl(this.paths.rewardsSendLoyaltyDailyTaper), fetchOptions);
-      
+
       clearTimeout(timeoutId);
       this.parseSetCookieHeaders(response.headers);
-      
+
       const text = await response.text();
       if (!text) return {};
-      
+
       try {
         return JSON.parse(text);
       } catch {
@@ -4590,9 +4757,9 @@ function printBalanceSummary(data) {
       const symbol = rawSymbol.toUpperCase();
       const amount = String(
         holding.amountDecimal ??
-          holding.amount ??
-          holding.amountBaseUnits ??
-          "0"
+        holding.amount ??
+        holding.amountBaseUnits ??
+        "0"
       ).trim();
 
       if (!symbol) {
@@ -4644,6 +4811,76 @@ function printBalanceSummary(data) {
   };
 }
 
+// ============================================================================
+// AUTO-ACCEPT PENDING OFFERS
+// ============================================================================
+// Checks for pending CC transfer offers (inbound) and auto-accepts them.
+// This is needed because sending via Canton address now creates a pending
+// offer that the recipient must accept, rather than crediting directly.
+// Uses bulk accept (POST /api/wallet/offers) which accepts all at once.
+// ============================================================================
+
+async function autoAcceptPendingOffers(client, accountLogTag = null) {
+  const tagLog = (msg) => console.log(withAccountTag(accountLogTag, msg));
+  try {
+    const offersResp = await apiCallWithTimeout(
+      () => client.getWalletOffers(),
+      "Get wallet offers",
+      15000
+    );
+    const offersData = isObject(offersResp.data) ? offersResp.data : {};
+    const offers = Array.isArray(offersData.offers) ? offersData.offers : [];
+
+    if (offers.length === 0) {
+      return 0;
+    }
+
+    tagLog(`[offers] Found ${offers.length} pending offer(s), auto-accepting...`);
+    for (const offer of offers) {
+      const amount = offer.amountDecimal || "?";
+      const from = offer.fromPartyHint || "unknown";
+      tagLog(`[offers]   ${amount} CC from ${from}`);
+    }
+
+    // Bulk accept all offers at once
+    try {
+      const acceptResp = await apiCallWithTimeout(
+        () => client.acceptAllWalletOffers(),
+        "Accept all offers",
+        30000
+      );
+      const acceptData = isObject(acceptResp.data) ? acceptResp.data : {};
+      const accepted = acceptData.accepted || 0;
+      const failed = acceptData.failed || 0;
+      tagLog(`[offers] ✓ Bulk accept: ${accepted} accepted, ${failed} failed`);
+      return accepted;
+    } catch (bulkErr) {
+      tagLog(`[offers] Bulk accept failed: ${bulkErr.message}, trying individual accept...`);
+
+      // Fallback: accept individually
+      let accepted = 0;
+      for (const offer of offers) {
+        try {
+          await apiCallWithTimeout(
+            () => client.acceptWalletOffer(offer),
+            `Accept offer ${(offer.contractId || "").slice(0, 16)}...`,
+            15000
+          );
+          accepted += 1;
+          tagLog(`[offers] ✓ Accepted ${offer.amountDecimal || "?"} CC from ${offer.fromPartyHint || "unknown"}`);
+        } catch (err) {
+          tagLog(`[offers] ✗ Failed: ${err.message}`);
+        }
+      }
+      tagLog(`[offers] Individual accept: ${accepted}/${offers.length}`);
+      return accepted;
+    }
+  } catch (error) {
+    tagLog(`[offers] Check failed (non-critical): ${error.message}`);
+    return 0;
+  }
+}
+
 // API call with timeout wrapper
 const API_CALL_TIMEOUT_MS = 30000; // 30 seconds
 const API_CALL_MAX_RETRIES = 2;
@@ -4676,11 +4913,11 @@ function calculateTimeoutBackoffMs(attempt) {
 
 async function apiCallWithTimeout(apiCall, label, timeoutMs = API_CALL_TIMEOUT_MS) {
   const startTime = Date.now();
-  
+
   const timeoutPromise = new Promise((_, reject) => {
     setTimeout(() => reject(new Error(`${label} timeout after ${timeoutMs}ms`)), timeoutMs);
   });
-  
+
   const result = await Promise.race([apiCall(), timeoutPromise]);
   const elapsed = Date.now() - startTime;
   console.log(`[info] ${label} completed in ${elapsed}ms`);
@@ -4711,7 +4948,7 @@ async function apiCallWithRetry(
         : `${label} (attempt ${attempt}/${maxRetries})`;
 
       const result = await apiCallWithTimeout(apiCall, attemptLabel, timeoutMs);
-      
+
       // Reset consecutive timeout counter on success
       consecutiveTimeouts = 0;
       return result;
@@ -4721,7 +4958,7 @@ async function apiCallWithRetry(
       // TIMEOUT errors: retry dengan exponential backoff, tapi limit consecutive timeouts
       if (isTimeoutError(error)) {
         consecutiveTimeouts += 1;
-        
+
         // Check if we've hit max consecutive timeouts - trigger soft restart
         if (consecutiveTimeouts >= maxConsecutiveTimeouts) {
           console.log(
@@ -4733,7 +4970,7 @@ async function apiCallWithRetry(
             consecutiveTimeouts
           );
         }
-        
+
         const backoffMs = calculateTimeoutBackoffMs(attempt);
         const backoffSec = Math.round(backoffMs / 1000);
         console.log(
@@ -4782,7 +5019,7 @@ async function recoverSendFlowByRefresh(
   const taggedLog = (message) => console.log(withAccountTag(accountLogTag, message));
   taggedLog(
     `[send-recovery] ${reasonLabel} ${recoveryAttempt}/${maxRecoveryAttempts}: ` +
-      (withBrowserRefresh ? "reset connection + browser refresh" : "light reset (no browser)")
+    (withBrowserRefresh ? "reset connection + browser refresh" : "light reset (no browser)")
   );
 
   await resetConnectionPool({ forceReset: forceConnectionReset });
@@ -4820,9 +5057,9 @@ async function recoverSendFlowByRefresh(
 
   const settleDelayMs = runPreflight
     ? Math.max(
-        1000,
-        clampToNonNegativeInt(config.session.checkpointSettleDelayMs, 3500)
-      )
+      1000,
+      clampToNonNegativeInt(config.session.checkpointSettleDelayMs, 3500)
+    )
     : 2000;
   await sleep(settleDelayMs);
 }
@@ -4863,24 +5100,38 @@ async function executeCcSendFlow(client, sendRequest, config, onCheckpointRefres
     console.log(`[warn] Recipient preview failed (non-critical): ${error.message}`);
   }
 
-  // Step 2b: Resolve recipient to get username for transfer
+  // Step 2b: Resolve recipient username for transfer
+  // Both username and canton_wallet transfers create offers that need accepting.
+  // Username is preferred but we fallback to canton_wallet if resolve fails.
   stepLog("[step] Resolve recipient");
-  let resolvedUsername = null;
-  try {
-    const resolveResponse = await apiCallWithTimeout(
-      () => client.resolveSendRecipient(sendRequest.address),
-      "Resolve recipient",
-      15000
-    );
-    const resolveData = isObject(resolveResponse.data) ? resolveResponse.data : {};
-    resolvedUsername = resolveData.username || null;
-    console.log(`[info] Resolved: username=${resolvedUsername || "n/a"} route=${resolveData.route || "n/a"}`);
-  } catch (error) {
-    const message = String(error && error.message ? error.message : "");
-    if (message.includes("No Roots user is linked to this Canton address")) {
-      console.log("[info] External wallet (not a Roots user), proceeding with direct transfer.");
-    } else {
-      console.log(`[warn] Resolve check failed: ${message}`);
+  let resolvedUsername = sendRequest.username || null;
+
+  // If username is pre-cached, skip the resolve API call
+  if (resolvedUsername) {
+    stepLog(`[info] Using cached username: ${resolvedUsername}`);
+  } else if (sendRequest.address) {
+    // Resolve from Canton address → username
+    try {
+      const resolveResponse = await apiCallWithTimeout(
+        () => client.resolveSendRecipient(sendRequest.address),
+        "Resolve recipient",
+        15000
+      );
+      const resolveData = isObject(resolveResponse.data) ? resolveResponse.data : {};
+      resolvedUsername = resolveData.username || null;
+      console.log(`[info] Resolved: username=${resolvedUsername || "n/a"} route=${resolveData.route || "n/a"}`);
+
+      // Cache the resolved username for future use
+      if (resolvedUsername && sendRequest.label) {
+        updateAccountUsername(sendRequest.label, resolvedUsername);
+      }
+    } catch (error) {
+      const message = String(error && error.message ? error.message : "");
+      if (message.includes("No Roots user is linked to this Canton address")) {
+        console.log("[info] External wallet (not a Roots user), proceeding with direct transfer.");
+      } else {
+        console.log(`[warn] Resolve check failed: ${message}`);
+      }
     }
   }
 
@@ -4921,8 +5172,7 @@ async function executeCcSendFlow(client, sendRequest, config, onCheckpointRefres
   const MAX_CHALLENGE_RESOLVES = 3;
   let challengeResolveAttempts = 0;
 
-  // Do NOT retry internally: Turnstile tokens are single-use, so a 2nd attempt
-  // with the same token will always 403. Outer loop handles captcha refresh.
+  // Use username-based if available, fallback to canton_wallet address
   const runTransferOnce = () => (resolvedUsername
     ? client.sendCcTransferByUsername(resolvedUsername, sendRequest.amount, idempotencyKey, challengeToken)
     : client.sendCcTransfer(sendRequest.address, sendRequest.amount, idempotencyKey, challengeToken));
@@ -5128,17 +5378,17 @@ const SESSION_REUSE_TIMEOUT_BACKOFF_SECONDS = 15;
 
 async function getBalanceWithTimeout(client, timeoutMs = BALANCE_CHECK_TIMEOUT_MS) {
   const startTime = Date.now();
-  
+
   try {
     const balancePromise = client.getBalances();
     const timeoutPromise = new Promise((_, reject) => {
       setTimeout(() => reject(new Error("Balance check timeout")), timeoutMs);
     });
-    
+
     const balanceResponse = await Promise.race([balancePromise, timeoutPromise]);
     const elapsed = Date.now() - startTime;
     console.log(`[info] Balance check completed in ${elapsed}ms`);
-    
+
     const balanceData = balanceResponse && balanceResponse.data ? balanceResponse.data : {};
     return printBalanceSummary(balanceData);
   } catch (error) {
@@ -5360,12 +5610,12 @@ async function refreshThisWeekRewardDashboard(client, dashboard, accountLogTag =
       // Extract today.buckets for Rewards Bucket dashboard column
       if (isObject(today.buckets)) {
         const b = today.buckets;
-        const bucketLabel = `A${b.activityPoints||0} V${b.volumePoints||0} T${b.tvlPoints||0} R${b.recipientPoints||0} H${b.habitPoints||0}`;
+        const bucketLabel = `A${b.activityPoints || 0} V${b.volumePoints || 0} T${b.tvlPoints || 0} R${b.recipientPoints || 0} H${b.habitPoints || 0}`;
         const todayTotal = today.totalPoints || 0;
         const todayCap = today.cap || 20;
         dashboard.setState({ rewardsBucket: `${todayTotal}/${todayCap} (${bucketLabel})` });
         console.log(withAccountTag(accountLogTag,
-          `[info] Today Rewards: ${todayTotal}/${todayCap}pts — Activity=${b.activityPoints||0} Volume=${b.volumePoints||0} TVL=${b.tvlPoints||0} Recipients=${b.recipientPoints||0} Habit=${b.habitPoints||0}`
+          `[info] Today Rewards: ${todayTotal}/${todayCap}pts — Activity=${b.activityPoints || 0} Volume=${b.volumePoints || 0} TVL=${b.tvlPoints || 0} Recipients=${b.recipientPoints || 0} Habit=${b.habitPoints || 0}`
         ));
       }
     }
@@ -5449,15 +5699,15 @@ async function executeSendBatch(client, sendRequests, config, dashboard, onCheck
       await sleep(BALANCE_GUARD_RETRY_DELAY_MS);
       currentBalance = await getBalanceWithTimeout(client, BALANCE_GUARD_RETRY_TIMEOUT_MS);
     }
-    
+
     if (currentBalance !== null) {
       dashboard.setState({
         balance: `CC=${currentBalance.cc} | USDCx=${currentBalance.usdcx} | CBTC=${currentBalance.cbtc}`
       });
-      
+
       console.log(`[info] Current balance: CC=${currentBalance.cc} (${currentBalance.ccNumeric}) | Available=${currentBalance.available}`);
       updateAccountCcBalance(senderAccountName, currentBalance.ccNumeric);
-      
+
       // Check if balance is sufficient (use ccNumeric for comparison)
       const requiredAmount = Number(sendRequest.amount);
       const requiredWithBuffer = requiredAmount + BALANCE_GUARD_MIN_BUFFER_CC;
@@ -5705,6 +5955,36 @@ async function executeSendBatch(client, sendRequests, config, dashboard, onCheck
           deferredState = {
             reason: "fragmented-balance",
             retryAfterSeconds,
+            requiredAmount: Number(sendRequest.amount),
+            availableAmount: null,
+            progress,
+            sendLabel: `${sendRequest.amount} CC -> ${sendRequest.label}`
+          };
+          break;
+        }
+
+        // ── Auto-delay on HTTP 400 hourly send limit ──
+        if (isHourlySendLimitError(error) && config.send.autoDelay400) {
+          const delayHours = config.send.autoDelayHour;
+          const delaySeconds = Math.round(delayHours * 3600);
+          const errorMessage = String(error && error.message ? error.message : error);
+          console.warn(
+            `[auto-delay-400] TX ${progress} server hourly send limit (HTTP 400). ` +
+            `AutoDelay400 enabled — pausing ${delayHours}h (${delaySeconds}s). Error: ${errorMessage}`
+          );
+          dashboard.setState({
+            phase: "cooldown",
+            status: "COOLDOWN",
+            transfer: `auto-delay-400 (${progress})`,
+            send: `Server hourly limit — waiting ${delayHours}h`,
+            cooldown: `${delaySeconds}s (auto-delay-400)`,
+            swapsTotal: progressForDashboard,
+            swapsOk: String(completedTx),
+            swapsFail: String(skippedTx)
+          });
+          deferredState = {
+            reason: "auto-delay-400",
+            retryAfterSeconds: delaySeconds,
             requiredAmount: Number(sendRequest.amount),
             availableAmount: null,
             progress,
@@ -6022,7 +6302,7 @@ async function refreshVercelSecurityCookies(client, config, reasonLabel, onCheck
   if (cooldownRemainingSeconds > 0 && (hadSecurityCookie || hadSessionCookie)) {
     console.log(
       `[warn] Browser challenge cooldown active (${cooldownRemainingSeconds}s). ` +
-        "Skipping Puppeteer refresh and deferring."
+      "Skipping Puppeteer refresh and deferring."
     );
     return {
       refreshed: false,
@@ -6048,7 +6328,7 @@ async function refreshVercelSecurityCookies(client, config, reasonLabel, onCheck
     if (cachedSecurityMap.size > 0) {
       console.log(
         `[warn] Browser challenge returned no cookies. ` +
-          `Applying ${cachedSecurityMap.size} cached security cookie(s) fallback.`
+        `Applying ${cachedSecurityMap.size} cached security cookie(s) fallback.`
       );
 
       client.mergeCookies(cachedSecurityMap);
@@ -6069,7 +6349,7 @@ async function refreshVercelSecurityCookies(client, config, reasonLabel, onCheck
     if (hadSecurityCookie || hadSessionCookie) {
       console.log(
         "[warn] Browser challenge returned no cookies (likely rate-limited/429). " +
-          "Keeping existing cookies and deferring refresh."
+        "Keeping existing cookies and deferring refresh."
       );
       return {
         refreshed: false,
@@ -6192,18 +6472,18 @@ async function attemptSessionReuse(client, config, onCheckpointRefresh, accountL
       } finally {
         releaseSessionReuseSlot(accountLogTag);
       }
-      
+
       // Step 2: Balance check (optional, timeout OK - session is still valid)
       logSession(`[info] Session reuse attempt ${attempt}: calling balances (timeout=15s)...`);
       const balanceStart = Date.now();
-      
+
       let balancesData = {};
       try {
         const balancePromise = client.getBalances();
         const timeoutPromise = new Promise((_, reject) => {
           setTimeout(() => reject(new Error("Balance check timeout (15s)")), 15000);
         });
-        
+
         const balancesResponse = await Promise.race([balancePromise, timeoutPromise]);
         balancesData = balancesResponse && balancesResponse.data ? balancesResponse.data : {};
         logSession(`[info] Session reuse attempt ${attempt}: balances OK (${Date.now() - balanceStart}ms)`);
@@ -6212,7 +6492,7 @@ async function attemptSessionReuse(client, config, onCheckpointRefresh, accountL
         logSession(`[warn] Balance check failed: ${balanceError.message}`);
         logSession(`[info] Session is still valid (sync-account passed), continuing without balance data...`);
       }
-      
+
       return {
         ok: true,
         balancesData
@@ -6271,7 +6551,7 @@ async function attemptSessionReuse(client, config, onCheckpointRefresh, accountL
           ) {
             logSession(
               `[info] Session reuse fetch/network failure detected. ` +
-                `Escalating to browser refresh immediately (${transientBrowserRefreshCount}/${maxTransientBrowserRefreshes}).`
+              `Escalating to browser refresh immediately (${transientBrowserRefreshCount}/${maxTransientBrowserRefreshes}).`
             );
           }
 
@@ -6299,7 +6579,7 @@ async function attemptSessionReuse(client, config, onCheckpointRefresh, accountL
           if (refreshResult && refreshResult.unavailable) {
             logSession(
               `[warn] Browser challenge temporarily unavailable. ` +
-                `Deferring session reuse ${browserChallengeRetryAfterSeconds}s.`
+              `Deferring session reuse ${browserChallengeRetryAfterSeconds}s.`
             );
             return buildTransientDeferral(
               "Session reuse deferred: browser challenge temporarily unavailable."
@@ -6387,7 +6667,7 @@ async function attemptSessionReuse(client, config, onCheckpointRefresh, accountL
           if (refreshError && refreshError.code === "BROWSER_CHALLENGE_NO_COOKIES") {
             logSession(
               `[warn] Browser challenge unavailable during checkpoint recovery. ` +
-                `Deferring session reuse ${browserChallengeRetryAfterSeconds}s.`
+              `Deferring session reuse ${browserChallengeRetryAfterSeconds}s.`
             );
             return buildTransientDeferral(
               "Session reuse deferred: browser challenge unavailable (checkpoint recovery)."
@@ -6399,7 +6679,7 @@ async function attemptSessionReuse(client, config, onCheckpointRefresh, accountL
         if (refreshResult && refreshResult.unavailable) {
           logSession(
             `[warn] Browser challenge temporarily unavailable during checkpoint recovery. ` +
-              `Deferring session reuse ${browserChallengeRetryAfterSeconds}s.`
+            `Deferring session reuse ${browserChallengeRetryAfterSeconds}s.`
           );
           return buildTransientDeferral(
             "Session reuse deferred: browser challenge temporarily unavailable (checkpoint recovery)."
@@ -6533,8 +6813,8 @@ async function processAccount(context) {
     : [];
   const safeSmartFillBlockRecipients = Array.isArray(smartFillBlockRecipients)
     ? smartFillBlockRecipients
-        .map((item) => String(item || "").trim())
-        .filter((item) => Boolean(item))
+      .map((item) => String(item || "").trim())
+      .filter((item) => Boolean(item))
     : [];
   const safeResumeFromDeferReason = String(resumeFromDeferReason || "").trim();
 
@@ -6573,9 +6853,9 @@ async function processAccount(context) {
     accountConfig.session.maxSessionReuseLightResets = 1;
     accountConfig.session.maxSessionReuseTransientBrowserRefreshes = resumeNeedsCheckpointRefresh
       ? Math.max(
-          1,
-          clampToNonNegativeInt(accountConfig.session.maxSessionReuseTransientBrowserRefreshes, 1)
-        )
+        1,
+        clampToNonNegativeInt(accountConfig.session.maxSessionReuseTransientBrowserRefreshes, 1)
+      )
       : 0;
     accountConfig.session.transientBrowserRefreshTriggerFailures = resumeNeedsCheckpointRefresh ? 1 : 2;
     accountConfig.session.sessionReuseTransientRetryAfterSeconds = 20;
@@ -6791,7 +7071,7 @@ async function processAccount(context) {
         });
         console.log(
           `[init] Send plan (internal-rotating): ${primaryRequest.amount} CC -> ${primaryRequest.label}` +
-            `${fallbackLabel} | offset=${internalPlan.primaryOffset} | tier=${senderTierKey} (${senderTierRange.min}-${senderTierRange.max})`
+          `${fallbackLabel} | offset=${internalPlan.primaryOffset} | tier=${senderTierKey} (${senderTierRange.min}-${senderTierRange.max})`
         );
       } else {
         dashboard.setState({ mode: "balance-only" });
@@ -6914,21 +7194,21 @@ async function processAccount(context) {
         hotRestartConfig.session.maxSessionReuseTransientAttempts = isDeferredResume
           ? 2
           : Math.max(
-              3,
-              Math.min(
-                6,
-                clampToNonNegativeInt(accountConfig.session.maxSessionReuseTransientAttempts, 6)
-              )
-            );
+            3,
+            Math.min(
+              6,
+              clampToNonNegativeInt(accountConfig.session.maxSessionReuseTransientAttempts, 6)
+            )
+          );
         hotRestartConfig.session.maxSessionReuseLightResets = isDeferredResume
           ? 1
           : Math.max(
+            1,
+            Math.min(
               1,
-              Math.min(
-                1,
-                clampToNonNegativeInt(accountConfig.session.maxSessionReuseLightResets, 1)
-              )
-            );
+              clampToNonNegativeInt(accountConfig.session.maxSessionReuseLightResets, 1)
+            )
+          );
         hotRestartConfig.session.maxSessionReuseTransientBrowserRefreshes = Math.max(
           0,
           Math.min(
@@ -7051,6 +7331,47 @@ async function processAccount(context) {
         });
         updateAccountCcBalance(account.name, balance.ccNumeric);
         recordInitialCcBalance(account.name, balance.ccNumeric);
+
+        // Auto-accept pending offers (both username & address transfers create offers)
+        const acceptedCount = await autoAcceptPendingOffers(client, accountLogTag);
+
+        // Auto-resolve own username if not yet cached
+        if (!getAccountUsername(account.name) && account.address) {
+          try {
+            const selfResolve = await apiCallWithTimeout(
+              () => client.resolveSendRecipient(account.address),
+              "Self-resolve username", 10000
+            );
+            const selfData = isObject(selfResolve.data) ? selfResolve.data : {};
+            if (selfData.username) {
+              updateAccountUsername(account.name, selfData.username);
+              console.log(withAccountTag(accountLogTag, `[info] Resolved own username: ${selfData.username}`));
+            }
+          } catch (err) {
+            console.log(withAccountTag(accountLogTag, `[warn] Self-resolve username failed (non-critical): ${err.message}`));
+          }
+        }
+
+        // Re-check balance after accepting offers to get updated CC amount
+        if (acceptedCount > 0) {
+          console.log(withAccountTag(accountLogTag, `[step] Re-checking balance after accepting ${acceptedCount} offer(s)...`));
+          try {
+            const reBalanceResp = await apiCallWithTimeout(
+              () => client.getBalances(),
+              "Re-check balance after offers",
+              15000
+            );
+            const reBalanceData = reBalanceResp && reBalanceResp.data ? reBalanceResp.data : {};
+            const reBalance = printBalanceSummary(reBalanceData);
+            dashboard.setState({
+              balance: `CC=${reBalance.cc} | USDCx=${reBalance.usdcx} | CBTC=${reBalance.cbtc}`
+            });
+            updateAccountCcBalance(account.name, reBalance.ccNumeric);
+            console.log(withAccountTag(accountLogTag, `[info] Updated balance after offers: CC=${reBalance.cc}`));
+          } catch (reBalErr) {
+            console.log(withAccountTag(accountLogTag, `[warn] Re-balance check failed (non-critical): ${reBalErr.message}`));
+          }
+        }
 
         await refreshThisWeekRewardDashboard(client, dashboard, accountLogTag, account.name);
 
@@ -7216,7 +7537,7 @@ async function processAccount(context) {
         if (!accountConfig.session.fallbackToOtpOnPersistentCheckpoint) {
           throw new Error(
             "Existing session still blocked by Vercel Security Checkpoint after refresh attempts. " +
-              "Fallback to OTP is disabled by config.session.fallbackToOtpOnPersistentCheckpoint=false."
+            "Fallback to OTP is disabled by config.session.fallbackToOtpOnPersistentCheckpoint=false."
           );
         }
 
@@ -7364,6 +7685,10 @@ async function processAccount(context) {
         const finalizeResponse = await client.finalizeReturning();
         const username = finalizeResponse && finalizeResponse.data ? finalizeResponse.data.username : pendingData.existingUsername;
         console.log(`[info] Finalized returning user: ${username || "unknown"}`);
+        if (username) {
+          updateAccountUsername(account.name, username);
+          console.log(withAccountTag(accountLogTag, `[info] Cached username: ${username}`));
+        }
       } else {
         throw new Error(
           "Account still in pending state and not marked alreadyActive. This script currently handles returning-account flow."
@@ -7384,6 +7709,47 @@ async function processAccount(context) {
     });
     updateAccountCcBalance(account.name, balance.ccNumeric);
     recordInitialCcBalance(account.name, balance.ccNumeric);
+
+    // Auto-accept pending offers (both username & address transfers create offers)
+    const acceptedCount2 = await autoAcceptPendingOffers(client, accountLogTag);
+
+    // Auto-resolve own username if not yet cached
+    if (!getAccountUsername(account.name) && account.address) {
+      try {
+        const selfResolve = await apiCallWithTimeout(
+          () => client.resolveSendRecipient(account.address),
+          "Self-resolve username", 10000
+        );
+        const selfData = isObject(selfResolve.data) ? selfResolve.data : {};
+        if (selfData.username) {
+          updateAccountUsername(account.name, selfData.username);
+          console.log(withAccountTag(accountLogTag, `[info] Resolved own username: ${selfData.username}`));
+        }
+      } catch (err) {
+        console.log(withAccountTag(accountLogTag, `[warn] Self-resolve username failed (non-critical): ${err.message}`));
+      }
+    }
+
+    // Re-check balance after accepting offers to get updated CC amount
+    if (acceptedCount2 > 0) {
+      console.log(withAccountTag(accountLogTag, `[step] Re-checking balance after accepting ${acceptedCount2} offer(s)...`));
+      try {
+        const reBalanceResp2 = await apiCallWithTimeout(
+          () => client.getBalances(),
+          "Re-check balance after offers",
+          15000
+        );
+        const reBalanceData2 = reBalanceResp2 && reBalanceResp2.data ? reBalanceResp2.data : {};
+        const reBalance2 = printBalanceSummary(reBalanceData2);
+        dashboard.setState({
+          balance: `CC=${reBalance2.cc} | USDCx=${reBalance2.usdcx} | CBTC=${reBalance2.cbtc}`
+        });
+        updateAccountCcBalance(account.name, reBalance2.ccNumeric);
+        console.log(withAccountTag(accountLogTag, `[info] Updated balance after offers: CC=${reBalance2.cc}`));
+      } catch (reBalErr) {
+        console.log(withAccountTag(accountLogTag, `[warn] Re-balance check failed (non-critical): ${reBalErr.message}`));
+      }
+    }
 
     await refreshThisWeekRewardDashboard(client, dashboard, accountLogTag, account.name);
 
@@ -8337,6 +8703,10 @@ async function run() {
     `minHoldBalanceCc=${config.safety.minHoldBalanceCc}, ` +
     `hourlyMaxTx=${HOURLY_MAX_TX_PER_ACCOUNT}/hr per account`
   );
+  console.log(
+    `[init] AutoDelay400: ${config.send.autoDelay400 ? "ON" : "OFF"} | ` +
+    `delay=${config.send.autoDelayHour}h when server returns HTTP 400 hourly limit`
+  );
 
   {
     const tg = config.telegram || {};
@@ -8415,7 +8785,7 @@ async function run() {
       throw new Error("Internal mode requires at least 2 accounts with 'address' field in accounts.json. Please fill in the cantonPartyId for each account.");
     }
     console.log(`[init] Accounts with address: ${accountsWithAddress.length}/${accounts.accounts.length}`);
-    
+
     const missingAddress = accounts.accounts.filter(acc => !String(acc.address || "").trim());
     if (missingAddress.length > 0) {
       console.log(`[warn] Accounts without address (will be skipped): ${missingAddress.map(a => a.name).join(", ")}`);
@@ -8428,7 +8798,7 @@ async function run() {
   if (sendMode === "external" || sendMode === "balance-only") {
     const accountSelection = await promptAccountSelection(accounts.accounts);
     selectedAccounts = accountSelection.selectedAccounts;
-    
+
     const accountNames = selectedAccounts.map(a => a.name).join(", ");
     console.log(`\n[init] Selected accounts (${selectedAccounts.length}): ${accountNames}`);
   } else if (sendMode === "internal") {
@@ -8460,7 +8830,7 @@ async function run() {
       // Reload tokens before each cycle (in case manually edited)
       const freshTokens = await readOptionalJson(tokensPath, "tokens");
       const reloadedTokens = normalizeTokens(freshTokens, cycleContext.accounts);
-      
+
       for (const accountEntry of cycleContext.accounts.accounts) {
         const profile = reloadedTokens.accounts[accountEntry.name] || normalizeTokenProfile({});
         if (!String(profile.cookie || "").trim() && cycleContext.legacyCookies.has(accountEntry.name)) {
@@ -8471,7 +8841,7 @@ async function run() {
 
       // Run the daily cycle
       const cycleResult = await runDailyCycle(cycleContext);
-      
+
       // Reset consecutive errors on success
       consecutiveErrors = 0;
 
@@ -8489,7 +8859,7 @@ async function run() {
       const now = new Date();
       const nextCycleTime = getNextMidnightUTC();
       const waitMs = Math.max(0, nextCycleTime - now);
-      
+
       if (waitMs > 0 && !args.dryRun) {
         console.log(`\n${"=".repeat(70)}`);
         console.log(`[cycle] Daily cycle #${cycleCount} completed!`);
@@ -8498,14 +8868,14 @@ async function run() {
         console.log(`[cycle] Next cycle at: ${formatUTCTime(nextCycleTime)}`);
         console.log(`[cycle] Waiting: ${formatDuration(waitMs)}`);
         console.log(`${"=".repeat(70)}\n`);
-        
+
         await sleep(waitMs);
       }
 
     } catch (error) {
       consecutiveErrors++;
       console.error(`\n[error] Cycle #${cycleCount} failed: ${error.message}`);
-      
+
       if (consecutiveErrors >= maxConsecutiveErrors) {
         console.error(`[fatal] ${maxConsecutiveErrors} consecutive errors. Stopping bot.`);
         throw error;
