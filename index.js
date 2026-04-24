@@ -1319,7 +1319,7 @@ class PinnedDashboard {
       timeZone: "Asia/Jakarta"
     });
     const rows = this.parseAccountRows();
-    const W = Math.max(40, Number(process.stdout.columns || 48));
+    const W = Math.max(72, Number(process.stdout.columns || 120));
     const modeLabel = String(this.state.mode || "-").toUpperCase();
 
     // ANSI helpers
@@ -1347,9 +1347,11 @@ class PinnedDashboard {
       return result + "…" + C.rst;
     };
 
-    // ── Panel widths ──
-    const LW = Math.max(24, Math.floor(W * 0.62));
-    const RW = W - LW - 1; // 1 char for │ divider
+    const LW = W >= 150
+      ? Math.min(104, Math.max(82, Math.floor(W * 0.44)))
+      : Math.max(42, Math.floor(W * 0.58));
+    const dividerWidth = 3;
+    const RW = Math.max(24, W - LW - dividerWidth);
 
     // ════════════════════════════════════
     // BUILD LEFT PANEL (header + accounts)
@@ -1357,19 +1359,18 @@ class PinnedDashboard {
     const L = [];
     const timeStr = (now.split(" ").pop() || now).slice(0, 8);
 
-    L.push(`${C.bold}${C.cyan}⚡RootsFi${C.rst} ${C.dim}${timeStr}${C.rst}`);
-    L.push(`${C.dim}${rows.length} Akun ${modeLabel}${C.rst}`);
+    L.push(`${C.bold}${C.cyan}RootsFi${C.rst} ${C.dim}${timeStr}${C.rst} ${C.white}${modeLabel}${C.rst} ${C.dim}${rows.length} akun${C.rst}`);
     L.push(
-      `${C.green}✓${this.state.swapsOk}${C.rst} ` +
-      `${C.red}✗${this.state.swapsFail}${C.rst} ` +
-      `${C.dim}Σ${C.rst}${this.state.swapsTotal} ` +
-      `${C.dim}tgt${C.rst}${this.state.targetPerDay}${C.dim}/d${C.rst}`
+      `${C.green}OK ${this.state.swapsOk}${C.rst}  ` +
+      `${C.red}FAIL ${this.state.swapsFail}${C.rst}  ` +
+      `${C.dim}TOTAL ${C.rst}${this.state.swapsTotal}  ` +
+      `${C.dim}TARGET ${C.rst}${this.state.targetPerDay}${C.dim}/d${C.rst}`
     );
 
     const rwk = getTotalRewardsThisWeek();
     const rdf = getTotalRewardsDiff();
     L.push(
-      `${C.dim}Rwd ${C.rst}${rwk.cc.toFixed(1)} ` +
+      `${C.dim}Reward ${C.rst}${rwk.cc.toFixed(1)} ` +
       `${rdf.cc >= 0 ? C.green + "+" : C.red}${rdf.cc.toFixed(1)}${C.rst}` +
       `${C.dim}CC $${rwk.usd.toFixed(0)}${C.rst}`
     );
@@ -1380,7 +1381,7 @@ class PinnedDashboard {
       "browser-checkpoint": C.magenta, "session-reuse": C.cyan
     }[String(this.state.phase || "").toLowerCase()] || C.white;
     L.push(
-      `${phColor}▸${String(this.state.phase || "-").toUpperCase().slice(0, 7)}${C.rst}` +
+      `${phColor}${String(this.state.phase || "-").toUpperCase().slice(0, 14)}${C.rst}` +
       (uptimeLabel ? ` ${C.dim}${uptimeLabel}${C.rst}` : "")
     );
 
@@ -1391,8 +1392,8 @@ class PinnedDashboard {
 
     L.push(`${C.dim}${"─".repeat(LW)}${C.rst}`);
 
-    // Account rows — 1 line each: marker+name status cc tier Δdiff
-    const nameW = Math.min(8, Math.floor(LW * 0.28));
+    // Account rows: dense, fixed-width columns so SSH terminals stay stable.
+    const nameW = Math.max(10, Math.min(16, Math.floor(LW * 0.2)));
     const stW = 4;
 
     // Format CC to max 2 decimal places, compact
@@ -1456,13 +1457,13 @@ class PinnedDashboard {
       L.push(
         `${C.dim} ${"Akun".padEnd(nameW)} ` +
         `${"Sts".padEnd(stW)} ` +
-        `${"CC".padEnd(7)}` +
-        `${"Tx".padEnd(4)}` +
+        `${"CC".padEnd(8)}` +
+        `${"Tx".padEnd(6)}` +
         `${"Sc".padStart(2)} ` +
         `${"Qly"} ` +
         `${"Tier"} ` +
-        `${"Rwd".padEnd(5)}` +
-        `${"Δ".padStart(5)}${C.rst}`
+        `${"Rwd".padEnd(6)}` +
+        `${"Diff".padStart(6)}${C.rst}`
       );
 
       const stMap = {
@@ -1502,17 +1503,17 @@ class PinnedDashboard {
         const rwd = fmtRwd(row.rewardsThisWeek);
 
         const txStats = getPerAccountTxStats(row.name);
-        const txLbl = `${txStats.ok}/${txStats.fail}`.padEnd(4);
+        const txLbl = `${txStats.ok}/${txStats.fail}`.padEnd(6);
 
         L.push(
           `${marker}${this.clip(row.name, nameW).padEnd(nameW)} ${C.rst}` +
           `${stColor}${st}${C.rst} ` +
-          `${C.cyan}${ccVal.padEnd(7)}${C.rst}` +
+          `${C.cyan}${ccVal.padEnd(8)}${C.rst}` +
           `${C.dim}${txLbl}${C.rst}` +
           `${C.white}${scoreNum}${C.rst} ` +
           `${bandColor}${scoreBand}${C.rst} ` +
           `${C.dim}${tier}${C.rst} ` +
-          `${C.yellow}${rwd}${C.rst}` +
+          `${C.yellow}${rwd.padEnd(6)}${C.rst}` +
           `${dfColor}${df}${C.rst}`
         );
       }
@@ -1526,40 +1527,43 @@ class PinnedDashboard {
       green: C.green, amber: C.yellow, red: C.red
     }[profitMode.toLowerCase()] || C.dim;
     L.push(
-      `${C.dim}${this.state.minDelay || "?"}s-${this.state.maxDelay || "?"}s ` +
-      `${HOURLY_MAX_TX_PER_ACCOUNT}/h ${C.rst}` +
-      `${profitColor}P:${profitMode}${C.rst}`
+      `${C.dim}Delay ${C.rst}${this.state.minDelay || "?"}-${this.state.maxDelay || "?"}s  ` +
+      `${C.dim}Cap ${C.rst}${HOURLY_MAX_TX_PER_ACCOUNT}/h  ` +
+      `${profitColor}Profit ${profitMode}${C.rst}`
     );
 
     // ════════════════════════════════
     // BUILD RIGHT PANEL (logs)
     // ════════════════════════════════
     const R = [];
-    R.push(`${C.dim}── Log (${this.logLines}) ──${C.rst}`);
+    R.push(`${C.bold}${C.white}Log terbaru${C.rst} ${C.dim}${this.logs.length}/${this.logLines}${C.rst}`);
     R.push(`${C.dim}${"─".repeat(RW)}${C.rst}`);
 
-    const logMsgW = Math.max(8, RW - 6);
+    const logPrefixW = 16;
+    const logMsgW = Math.max(8, RW - logPrefixW);
     if (this.logs.length === 0) {
       R.push(`${C.dim}(empty)${C.rst}`);
     } else {
       // Only show last this.logLines entries (respects config.ui.logLines)
       const visibleLogs = this.logs.slice(-this.logLines);
       for (const log of visibleLogs) {
-        const lc = log.level === "ERROR" ? C.red
-          : (log.level === "WARN" ? C.yellow : C.dim);
-        const ts = log.time.slice(0, 5);
+        const levelLabel = this.clip(String(log.level || "INFO").toUpperCase(), 7).padEnd(7);
+        const lc = levelLabel.trim() === "ERROR" ? C.red
+          : (levelLabel.trim() === "WARN" ? C.yellow : C.dim);
+        const ts = log.time;
+        const prefix = `${C.dim}${ts}${C.rst} ${lc}${levelLabel}${C.rst}`;
         const msg = String(log.message || "");
         // Wrap long messages to multiple lines instead of truncating
         if (msg.length <= logMsgW) {
-          R.push(`${C.dim}${ts}${C.rst}${lc}${msg}${C.rst}`);
+          R.push(`${prefix} ${C.white}${msg}${C.rst}`);
         } else {
           // First line with timestamp
-          R.push(`${C.dim}${ts}${C.rst}${lc}${msg.slice(0, logMsgW)}${C.rst}`);
+          R.push(`${prefix} ${C.white}${msg.slice(0, logMsgW)}${C.rst}`);
           // Continuation lines (indented, no timestamp)
           let pos = logMsgW;
-          const contW = RW - 1; // full width minus 1 indent space
+          const contW = Math.max(8, RW - logPrefixW - 1);
           while (pos < msg.length) {
-            R.push(`${lc} ${msg.slice(pos, pos + contW)}${C.rst}`);
+            R.push(`${" ".repeat(logPrefixW)}${C.dim}${msg.slice(pos, pos + contW)}${C.rst}`);
             pos += contW;
           }
         }
@@ -1577,7 +1581,7 @@ class PinnedDashboard {
     output.push(C.dim + "━".repeat(W) + C.rst);
     for (let i = 0; i < maxH; i++) {
       output.push(
-        `${fitCell(L[i], LW)}${C.dim}│${C.rst}${fitCell(R[i], RW)}`
+        `${fitCell(L[i], LW)} ${C.dim}│${C.rst} ${fitCell(R[i], RW)}`
       );
     }
     output.push(C.dim + "━".repeat(W) + C.rst);
@@ -3069,7 +3073,9 @@ function normalizeConfig(rawConfig) {
 
   const captchaInput = isObject(rawConfig.captcha) ? rawConfig.captcha : {};
   const captchaProvider = String(captchaInput.provider || "self-hosted").toLowerCase().trim();
-  const validProviders = ["self-hosted", "2captcha", "auto"];
+  const validProviders = ["self-hosted", "2captcha", "multibot", "auto"];
+  const fallbackProviderInput = String(captchaInput.fallbackProvider || "2captcha").toLowerCase().trim();
+  const validFallbackProviders = ["2captcha", "multibot"];
 
   // solverUrl supports single string or array of strings for load balancing
   let solverUrls;
@@ -3087,6 +3093,7 @@ function normalizeConfig(rawConfig) {
 
   const captcha = {
     provider: validProviders.includes(captchaProvider) ? captchaProvider : "self-hosted",
+    fallbackProvider: validFallbackProviders.includes(fallbackProviderInput) ? fallbackProviderInput : "2captcha",
     solverUrl: solverUrls.length === 1 ? solverUrls[0] : solverUrls[0],
     solverUrls: solverUrls,
     apiKey: String(captchaInput.apiKey || "").trim()
@@ -3641,12 +3648,15 @@ function isTrafficCongestionError(error) {
 // Supported providers (config.captcha.provider):
 //   "self-hosted" — Turnstile-Solver lokal (GRATIS, default)
 //   "2captcha"    — 2Captcha API (berbayar, butuh apiKey)
-//   "auto"        — coba self-hosted dulu, fallback ke 2captcha jika gagal
+//   "multibot"    — Multibot API (berbayar, butuh apiKey)
+//   "auto"        — coba self-hosted dulu, fallback ke remote provider jika gagal
 // ============================================================================
 const TURNSTILE_SITEKEY = "0x4AAAAAAC-oOGMu5lxFvc7w";
 const TURNSTILE_PAGEURL = "https://bridge.rootsfi.com/send";
 const TWOCAPTCHA_IN_URL = "https://2captcha.com/in.php";
 const TWOCAPTCHA_RES_URL = "https://2captcha.com/res.php";
+const MULTIBOT_IN_URL = "https://api.multibot.cloud/in.php";
+const MULTIBOT_RES_URL = "https://api.multibot.cloud/res.php";
 const TWOCAPTCHA_POLL_INTERVAL_MS = 5000;
 const TWOCAPTCHA_POLL_TIMEOUT_MS = 180000;
 const TWOCAPTCHA_INITIAL_WAIT_MS = 10000;
@@ -3669,8 +3679,67 @@ function isTrafficChallengeRequiredError(error) {
 }
 
 async function solveTurnstileVia2Captcha(apiKey, { sitekey = TURNSTILE_SITEKEY, pageurl = TURNSTILE_PAGEURL } = {}) {
+  return solveTurnstileViaRemoteCaptcha("2captcha", apiKey, { sitekey, pageurl });
+}
+
+async function solveTurnstileViaMultibot(apiKey, { sitekey = TURNSTILE_SITEKEY, pageurl = TURNSTILE_PAGEURL } = {}) {
+  return solveTurnstileViaRemoteCaptcha("multibot", apiKey, { sitekey, pageurl });
+}
+
+function resolveRemoteCaptchaProvider(providerName) {
+  const normalized = String(providerName || "").toLowerCase().trim();
+  if (normalized === "2captcha") {
+    return {
+      name: "2captcha",
+      label: "2Captcha",
+      inUrl: TWOCAPTCHA_IN_URL,
+      resUrl: TWOCAPTCHA_RES_URL
+    };
+  }
+  if (normalized === "multibot") {
+    return {
+      name: "multibot",
+      label: "Multibot",
+      inUrl: MULTIBOT_IN_URL,
+      resUrl: MULTIBOT_RES_URL
+    };
+  }
+  throw new Error(`Unknown remote captcha provider: ${providerName}`);
+}
+
+function parseRemoteCaptchaResponse(responseText) {
+  const text = String(responseText || "").trim();
+  if (!text) {
+    return { status: "error", value: "empty response" };
+  }
+
+  try {
+    const parsed = JSON.parse(text);
+    if (parsed && typeof parsed === "object" && Object.prototype.hasOwnProperty.call(parsed, "status")) {
+      if (Number(parsed.status) === 1) {
+        return { status: "ok", value: String(parsed.request || "").trim() };
+      }
+      const request = String(parsed.request || "").trim();
+      if (request === "CAPCHA_NOT_READY") {
+        return { status: "pending", value: request };
+      }
+      return { status: "error", value: request || text.slice(0, 200) };
+    }
+  } catch { }
+
+  if (text === "CAPCHA_NOT_READY") {
+    return { status: "pending", value: text };
+  }
+  if (text.startsWith("OK|")) {
+    return { status: "ok", value: text.slice(3).trim() };
+  }
+  return { status: "error", value: text.slice(0, 200) };
+}
+
+async function solveTurnstileViaRemoteCaptcha(providerName, apiKey, { sitekey = TURNSTILE_SITEKEY, pageurl = TURNSTILE_PAGEURL } = {}) {
+  const provider = resolveRemoteCaptchaProvider(providerName);
   if (!apiKey) {
-    throw new Error("2Captcha API key missing (config.captcha.apiKey)");
+    throw new Error(`${provider.label} API key missing (config.captcha.apiKey)`);
   }
 
   const fetchFn = (typeof globalThis.fetch === "function") ? globalThis.fetch.bind(globalThis) : null;
@@ -3678,59 +3747,46 @@ async function solveTurnstileVia2Captcha(apiKey, { sitekey = TURNSTILE_SITEKEY, 
     throw new Error("global fetch is not available in this Node runtime");
   }
 
-  const submitUrl = `${TWOCAPTCHA_IN_URL}?key=${encodeURIComponent(apiKey)}`
+  const submitUrl = `${provider.inUrl}?key=${encodeURIComponent(apiKey)}`
     + `&method=turnstile&sitekey=${encodeURIComponent(sitekey)}`
-    + `&pageurl=${encodeURIComponent(pageurl)}&json=1`;
-
+    + `&pageurl=${encodeURIComponent(pageurl)}`;
   const submitResp = await fetchFn(submitUrl, { method: "GET" });
   const submitText = await submitResp.text();
-  let submitJson;
-  try {
-    submitJson = JSON.parse(submitText);
-  } catch {
-    throw new Error(`2Captcha in.php returned non-JSON: ${submitText.slice(0, 200)}`);
-  }
-  if (!submitJson || submitJson.status !== 1) {
-    throw new Error(`2Captcha in.php error: ${submitJson && submitJson.request ? submitJson.request : submitText.slice(0, 200)}`);
+  const submitResult = parseRemoteCaptchaResponse(submitText);
+  if (submitResult.status !== "ok" || !submitResult.value) {
+    throw new Error(`${provider.label} in.php error: ${submitResult.value || submitText.slice(0, 200)}`);
   }
 
-  const captchaId = String(submitJson.request);
-  console.log(`[captcha] 2Captcha task submitted (id=${captchaId}). Waiting for solve...`);
+  const captchaId = submitResult.value;
+  console.log(`[captcha] ${provider.label} task submitted (id=${captchaId}). Waiting for solve...`);
   await sleep(TWOCAPTCHA_INITIAL_WAIT_MS);
 
   const deadline = Date.now() + TWOCAPTCHA_POLL_TIMEOUT_MS;
   while (Date.now() < deadline) {
-    const pollUrl = `${TWOCAPTCHA_RES_URL}?key=${encodeURIComponent(apiKey)}`
-      + `&action=get&id=${encodeURIComponent(captchaId)}&json=1`;
+    const pollUrl = `${provider.resUrl}?key=${encodeURIComponent(apiKey)}`
+      + `&action=get&id=${encodeURIComponent(captchaId)}`;
     const pollResp = await fetchFn(pollUrl, { method: "GET" });
     const pollText = await pollResp.text();
-    let pollJson;
-    try {
-      pollJson = JSON.parse(pollText);
-    } catch {
-      console.log(`[captcha] poll parse error: ${pollText.slice(0, 160)}. Retrying...`);
-      await sleep(TWOCAPTCHA_POLL_INTERVAL_MS);
-      continue;
-    }
+    const pollResult = parseRemoteCaptchaResponse(pollText);
 
-    if (pollJson.status === 1) {
-      const token = String(pollJson.request || "").trim();
+    if (pollResult.status === "ok") {
+      const token = String(pollResult.value || "").trim();
       if (!token) {
-        throw new Error("2Captcha returned empty token");
+        throw new Error(`${provider.label} returned empty token`);
       }
-      console.log(`[captcha] Turnstile token received (len=${token.length}).`);
+      console.log(`[captcha] Turnstile token received via ${provider.label} (len=${token.length}).`);
       return token;
     }
 
-    if (pollJson.request === "CAPCHA_NOT_READY") {
+    if (pollResult.status === "pending") {
       await sleep(TWOCAPTCHA_POLL_INTERVAL_MS);
       continue;
     }
 
-    throw new Error(`2Captcha res.php error: ${pollJson.request || pollText.slice(0, 200)}`);
+    throw new Error(`${provider.label} res.php error: ${pollResult.value || pollText.slice(0, 200)}`);
   }
 
-  throw new Error(`2Captcha timed out after ${TWOCAPTCHA_POLL_TIMEOUT_MS / 1000}s waiting for Turnstile token`);
+  throw new Error(`${provider.label} timed out after ${TWOCAPTCHA_POLL_TIMEOUT_MS / 1000}s waiting for Turnstile token`);
 }
 
 /**
@@ -3836,7 +3892,7 @@ async function solveTurnstileViaSelfHosted(solverBaseUrl, { sitekey = TURNSTILE_
 /**
  * Smart captcha solver wrapper — auto-selects provider based on config.
  * Supports multiple solver URLs with round-robin load balancing.
- * Provider options: "self-hosted" (default, gratis), "2captcha" (berbayar), "auto" (coba self-hosted dulu).
+ * Provider options: "self-hosted" (default, gratis), "2captcha", "multibot", "auto".
  */
 async function solveTurnstile(captchaConfig) {
   const provider = String(captchaConfig && captchaConfig.provider || "self-hosted").toLowerCase().trim();
@@ -3844,13 +3900,17 @@ async function solveTurnstile(captchaConfig) {
     ? captchaConfig.solverUrls
     : [String(captchaConfig && captchaConfig.solverUrl || SELFHOSTED_SOLVER_DEFAULT_URL).trim()];
   const apiKey = String(captchaConfig && captchaConfig.apiKey || "").trim();
+  const fallbackProvider = String(captchaConfig && captchaConfig.fallbackProvider || "2captcha").toLowerCase().trim();
 
-  if (provider === "2captcha") {
+  if (provider === "2captcha" || provider === "multibot") {
+    const remoteProvider = resolveRemoteCaptchaProvider(provider);
     if (!apiKey) {
-      throw new Error("Provider 2captcha dipilih tapi config.captcha.apiKey kosong!");
+      throw new Error(`Provider ${provider} dipilih tapi config.captcha.apiKey kosong!`);
     }
-    console.log("[captcha] Solving Turnstile via 2Captcha (berbayar)...");
-    return solveTurnstileVia2Captcha(apiKey);
+    console.log(`[captcha] Solving Turnstile via ${remoteProvider.label} (berbayar)...`);
+    return provider === "multibot"
+      ? solveTurnstileViaMultibot(apiKey)
+      : solveTurnstileVia2Captcha(apiKey);
   }
 
   if (provider === "self-hosted") {
@@ -3875,7 +3935,7 @@ async function solveTurnstile(captchaConfig) {
   }
 
   if (provider === "auto") {
-    // Coba semua self-hosted dulu (round-robin), fallback ke 2captcha
+    // Coba semua self-hosted dulu (round-robin), fallback ke remote provider
     const errors = [];
     for (let i = 0; i < solverUrls.length; i++) {
       const idx = (_solverRoundRobinIndex + i) % solverUrls.length;
@@ -3890,17 +3950,20 @@ async function solveTurnstile(captchaConfig) {
         errors.push({ url, error: err });
       }
     }
-    // All self-hosted failed, try 2captcha fallback
+    // All self-hosted failed, try configured remote fallback
     if (apiKey) {
-      console.log("[captcha] [auto] Semua self-hosted gagal. Fallback ke 2Captcha...");
-      return solveTurnstileVia2Captcha(apiKey);
+      const remoteProvider = resolveRemoteCaptchaProvider(fallbackProvider);
+      console.log(`[captcha] [auto] Semua self-hosted gagal. Fallback ke ${remoteProvider.label}...`);
+      return fallbackProvider === "multibot"
+        ? solveTurnstileViaMultibot(apiKey)
+        : solveTurnstileVia2Captcha(apiKey);
     }
-    console.log("[captcha] [auto] Semua solver gagal, tidak ada fallback 2Captcha.");
+    console.log("[captcha] [auto] Semua solver gagal, tidak ada fallback remote provider.");
     const lastErr = errors.length > 0 ? errors[errors.length - 1].error : new Error("No solver URLs configured");
     throw lastErr;
   }
 
-  throw new Error(`Provider captcha tidak dikenal: "${provider}". Gunakan: "self-hosted", "2captcha", atau "auto".`);
+  throw new Error(`Provider captcha tidak dikenal: "${provider}". Gunakan: "self-hosted", "2captcha", "multibot", atau "auto".`);
 }
 
 let lastProfitabilityStatus = null;
