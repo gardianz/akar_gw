@@ -2630,6 +2630,9 @@ function normalizeConfig(rawConfig) {
 
   const sessionInput = isObject(rawConfig.session) ? rawConfig.session : {};
   const session = {
+    // Hardcoded: website migrated from Vercel Security Checkpoint to Cloudflare.
+    // No _vcrcs cookies needed anymore. Browser challenge is permanently skipped.
+    skipVercelChallenge: true,
     preflightOnboard:
       typeof sessionInput.preflightOnboard === "boolean"
         ? sessionInput.preflightOnboard
@@ -3307,6 +3310,22 @@ async function solveBrowserChallenge(baseUrl, onboardPath, userAgent, headless =
 
     if (status === 429) {
       console.log(`[browser] 429 detected, using 429 challenge mode (${probeAttempts} checks).`);
+    }
+
+    // If page loaded with 200 and no challenge, cookies may already be available
+    // (Cloudflare-proxied sites don't set _vc* cookies anymore)
+    if (status === 200) {
+      const initialCookies = await page.cookies();
+      if (initialCookies.length > 0 || !response) {
+        console.log(`[browser] Page loaded with HTTP 200 — no Vercel challenge detected (${initialCookies.length} cookies). Skipping challenge poll.`);
+        // Return whatever cookies are available
+        const cookieMap = new Map();
+        for (const cookie of initialCookies) {
+          cookieMap.set(cookie.name, cookie.value);
+        }
+        cacheSecurityCookiesFromMap(cookieMap, "browser-no-challenge");
+        return cookieMap;
+      }
     }
 
     console.log("[browser] Waiting for Vercel challenge to resolve...");
@@ -5980,6 +5999,17 @@ async function executeSendBatch(client, sendRequests, config, dashboard, onCheck
 }
 
 async function refreshVercelSecurityCookies(client, config, reasonLabel, onCheckpointRefresh) {
+  // Skip browser challenge entirely if website no longer uses Vercel Security Checkpoint
+  if (true /* skipVercelChallenge: website migrated to Cloudflare */) {
+    console.log(`[info] ${reasonLabel} — SKIPPED (skipVercelChallenge=true, website uses Cloudflare now)`);
+    return {
+      refreshed: true,
+      unavailable: false,
+      retryAfterSeconds: 0,
+      reason: "skipped-no-vercel-challenge"
+    };
+  }
+
   console.log(`[info] ${reasonLabel}`);
   const hadSecurityCookie = client.hasSecurityCookie();
   const hadSessionCookie = client.hasAccountSessionCookie();
@@ -6809,7 +6839,8 @@ async function processAccount(context) {
       }
     }
 
-    if (shouldRefreshVercelCookie(lastVercelRefreshAt, accountConfig.session.proactiveVercelRefreshMinutes)) {
+    // skipVercelChallenge: website migrated to Cloudflare, proactive refresh permanently disabled
+    if (false && shouldRefreshVercelCookie(lastVercelRefreshAt, accountConfig.session.proactiveVercelRefreshMinutes)) {
       dashboard.setState({ phase: "vercel-refresh" });
       console.log(
         withAccountTag(
@@ -6832,17 +6863,24 @@ async function processAccount(context) {
     }
 
     if (!client.hasValidSession()) {
-      dashboard.setState({ phase: "browser-checkpoint" });
-      console.log("[info] No valid session cookies found, launching browser...");
-      await refreshVercelSecurityCookies(
-        client,
-        accountConfig,
-        "Initial browser verification required",
-        markCheckpointRefresh
-      );
-      console.log("[info] Browser cookies merged from challenge flow");
-      client.logCookieStatus("after browser merge");
-      updateCookieDashboard(client);
+      if (true /* skipVercelChallenge: Cloudflare */) {
+        // Website no longer uses Vercel checkpoint — skip browser challenge.
+        // Session will be established via OTP or session reuse without _vcrcs.
+        console.log("[info] No valid session cookies found — Vercel challenge skipped (website uses Cloudflare)");
+        console.log("[info] Will proceed to session reuse or OTP flow directly.");
+      } else {
+        dashboard.setState({ phase: "browser-checkpoint" });
+        console.log("[info] No valid session cookies found, launching browser...");
+        await refreshVercelSecurityCookies(
+          client,
+          accountConfig,
+          "Initial browser verification required",
+          markCheckpointRefresh
+        );
+        console.log("[info] Browser cookies merged from challenge flow");
+        client.logCookieStatus("after browser merge");
+        updateCookieDashboard(client);
+      }
     } else {
       console.log("[info] Using existing session cookies from tokens.json");
     }
@@ -8174,13 +8212,17 @@ async function runOtpOnlyFlow(context) {
     const client = new RootsFiApiClient(accountConfig);
 
     try {
-      console.log(`[step] ${tag}: Browser challenge (ambil _vcrcs)`);
-      await refreshVercelSecurityCookies(
-        client,
-        accountConfig,
-        `OTP-mode fresh browser challenge (${account.name})`,
-        markCheckpointRefresh
-      );
+      if (true /* skipVercelChallenge: Cloudflare */) {
+        console.log(`[step] ${tag}: Browser challenge skipped (website uses Cloudflare)`);
+      } else {
+        console.log(`[step] ${tag}: Browser challenge (ambil _vcrcs)`);
+        await refreshVercelSecurityCookies(
+          client,
+          accountConfig,
+          `OTP-mode fresh browser challenge (${account.name})`,
+          markCheckpointRefresh
+        );
+      }
 
       console.log(`[step] ${tag}: Send OTP ke ${maskEmail(selectedEmail)}`);
       const sendOtpResponse = await sendOtpWithCheckpointRecovery(
